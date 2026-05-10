@@ -6,11 +6,14 @@ The workspace also contains **The White Figure**, a separate first-person walkin
 
 It also contains **The Endless Airport Gate**, a third first-person walking game set inside a surreal terminal where Gate 47 is always visible somewhere in the distance but never nearby. Polished concourses, gate counters, moving walkways, baggage conveyors, escalator-like ramps, glass walls, and repeating overhead architecture create puzzle-like temporal loops.
 
+It also contains **Cube World Path**, a fourth first-person mining game set on a hellish, randomly sized solid cubic voxel world from 32x32x32 through 64x64x64. The player starts on the top face of the cube and must mine down to a target on the opposite bottom face. Only one complete route reaches the target; false mineable branches, unbreakable rock, and toxic uranium veins block false progress.
+
 ## Controls
 
 - `WASD` - walk
 - `Shift` - move faster
 - `Space` - jump
+- Left mouse - mine the highlighted block in Cube World Path
 - `E` - drink at oasis water in The White Figure
 - `Q` - use the water-powered jetpack in The White Figure
 - Left mouse - fire weapon in The White Figure
@@ -43,6 +46,7 @@ The executables are written to:
 - `build\DeadChannel.exe`
 - `build\TheWhiteFigure.exe`
 - `build\EndlessAirportGate.exe`
+- `build\CubeWorldPath.exe`
 
 ## External Signal Telemetry
 
@@ -97,3 +101,11 @@ The Endless Airport Gate also publishes player telemetry for external games and 
 - Separate terminal aesthetic with polished tile floors, glass walls, suspended light bars, airport signage, gate counters, seats, baggage conveyors, moving walkways, and escalator structures
 - Gate 47 is procedurally repositioned through looping stages when approached, then becomes reachable after roughly a 15-20 minute route
 - Conveyor and walkway bands subtly affect player movement, giving the terminal a different traversal rhythm from the other two games
+
+## Cube World Path
+
+- Uses the same native Win32 OpenGL 3.3 approach with shader-rendered VBO voxel faces
+- Generates a solid cube world across the 32x32x32 to 64x64x64 size spectrum, with 50% larger blocks, false mineable branches, and exactly one complete route from the top starting face to the opposite bottom target face
+- Brown soft path blocks can be mined; grey rock is unbreakable; glowing green uranium is toxic and unbreakable
+- Hellish shader treatment adds charred stone, ember cracks, acidic uranium glow, red fog, and hot target lighting
+- The player walks and jumps through opened tunnels while mining forward through the cube

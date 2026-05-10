@@ -10,4 +10,5 @@ if not exist build mkdir build
 cl /nologo /EHsc /O2 /std:c++17 src\DeadChannel.cpp /Fe:build\DeadChannel.exe user32.lib gdi32.lib opengl32.lib winmm.lib
 cl /nologo /EHsc /O2 /std:c++17 src\TheWhiteFigure.cpp /Fe:build\TheWhiteFigure.exe user32.lib gdi32.lib opengl32.lib winmm.lib
 cl /nologo /EHsc /O2 /std:c++17 src\EndlessAirportGate.cpp /Fe:build\EndlessAirportGate.exe user32.lib gdi32.lib opengl32.lib winmm.lib
+cl /nologo /EHsc /O2 /std:c++17 src\CubeWorldPath.cpp /Fe:build\CubeWorldPath.exe user32.lib gdi32.lib opengl32.lib winmm.lib
 endlocal
