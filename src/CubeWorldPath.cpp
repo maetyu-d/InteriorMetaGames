@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <vector>
 
 #pragma comment(lib, "opengl32.lib")
@@ -68,16 +69,44 @@ struct IVec3 { int x, y, z; };
 struct Vertex { Vec3 p, n, c; float kind; };
 struct Mat4 { float m[16]; };
 
+#pragma pack(push, 1)
+struct SignalTelemetry {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t byteSize;
+    uint32_t sequence;
+    float timeSeconds;
+    float realDistance;
+    float targetDistance;
+    float planarDistance;
+    float threeDimensionalDistance;
+    float playerX, playerY, playerZ;
+    float playerVelocityX, playerVelocityY, playerVelocityZ;
+    float playerSpeed;
+    float playerHorizontalSpeed;
+    float playerFacingX, playerFacingY, playerFacingZ;
+    float playerMoveDirX, playerMoveDirY, playerMoveDirZ;
+    float playerYaw, playerPitch;
+    float targetX, targetY, targetZ;
+    int32_t targetCellX, targetCellY, targetCellZ;
+    int32_t worldSize;
+    float signalReached;
+};
+#pragma pack(pop)
+
 static HWND g_hwnd = nullptr;
 static HDC g_hdc = nullptr;
 static HGLRC g_glrc = nullptr;
 static bool g_running = true;
 static bool g_focused = true;
 static bool g_mouseCaptured = true;
+static bool g_mousePrimed = false;
+static int g_mouseIgnoreFrames = 8;
 static bool g_mineRequest = false;
 static int g_width = 1280, g_height = 720;
 static LARGE_INTEGER g_lastCounter{}, g_frequency{};
 static float g_time = 0.0f;
+static float g_telemetryFileTimer = 0.0f;
 static float g_health = 1.0f;
 static bool g_reached = false;
 static float g_verticalVelocity = 0.0f;
@@ -102,6 +131,11 @@ static std::vector<Vertex> g_mesh;
 static std::vector<Vertex> g_highlight;
 static std::vector<Vertex> g_debris;
 static bool g_meshDirty = true;
+static HANDLE g_telemetryMapping = nullptr;
+static SignalTelemetry* g_telemetry = nullptr;
+static char g_telemetryPath[MAX_PATH] = {};
+static Vec3 g_lastTelemetryPlayer{};
+static bool g_hasTelemetryPlayer = false;
 
 static constexpr float kBlockSize = 1.5f;
 static constexpr float kEye = 1.55f;
@@ -109,6 +143,7 @@ static constexpr float kPlayerRadius = 0.245f;
 static constexpr float kGravity = 30.0f;
 static constexpr float kMaxFallSpeed = 24.0f;
 static constexpr float kDropCommitSpeed = 9.0f;
+static constexpr uint32_t kTelemetryMagic = 0x43575054u; // CWPT
 enum Block : uint8_t { Air = 0, Soft = 1, Rock = 2, Uranium = 3, Target = 4 };
 static int g_worldN = 32;
 static std::vector<uint8_t> g_blocks;
@@ -127,6 +162,12 @@ static float dot(Vec3 a, Vec3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
 static Vec3 cross(Vec3 a, Vec3 b) { return {a.y*b.z-a.z*b.y, a.z*b.x-a.x*b.z, a.x*b.y-a.y*b.x}; }
 static float length(Vec3 v) { return std::sqrt(std::max(0.0f, dot(v, v))); }
 static Vec3 norm(Vec3 v) { float l = std::sqrt(std::max(0.000001f, dot(v, v))); return {v.x/l, v.y/l, v.z/l}; }
+static float wrapAngle(float a) {
+    const float pi = 3.14159265f;
+    while (a > pi) a -= pi * 2.0f;
+    while (a < -pi) a += pi * 2.0f;
+    return a;
+}
 static float worldHalf() { return static_cast<float>(g_worldN) * kBlockSize * 0.5f; }
 static int idx(int x, int y, int z) { return x + y * g_worldN + z * g_worldN * g_worldN; }
 static bool inBounds(int x, int y, int z) { return x >= 0 && y >= 0 && z >= 0 && x < g_worldN && y < g_worldN && z < g_worldN; }
@@ -180,6 +221,146 @@ static Vec3 forward() {
     return norm({std::sin(g_yaw) * cp, std::sin(g_pitch), std::cos(g_yaw) * cp});
 }
 static bool footBlocked(Vec3 p);
+
+static void initTelemetry() {
+    g_telemetryMapping = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                            sizeof(SignalTelemetry), "Local\\CubeWorldPathTelemetry");
+    if (g_telemetryMapping) {
+        g_telemetry = static_cast<SignalTelemetry*>(
+            MapViewOfFile(g_telemetryMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SignalTelemetry)));
+    }
+    if (g_telemetry) {
+        std::memset(g_telemetry, 0, sizeof(SignalTelemetry));
+        g_telemetry->magic = kTelemetryMagic;
+        g_telemetry->version = 1;
+        g_telemetry->byteSize = sizeof(SignalTelemetry);
+    }
+    g_lastTelemetryPlayer = g_pos;
+    g_hasTelemetryPlayer = true;
+
+    char exePath[MAX_PATH] = {};
+    DWORD len = GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+    if (len > 0 && len < MAX_PATH) {
+        char* slash = std::strrchr(exePath, '/');
+        char* backslash = std::strrchr(exePath, '\\');
+        if (backslash && (!slash || backslash > slash)) slash = backslash;
+        if (slash) *(slash + 1) = '\0';
+        std::snprintf(g_telemetryPath, sizeof(g_telemetryPath), "%sCubeWorldPathTelemetry.json", exePath);
+    }
+}
+
+static void writeTelemetryFile(const SignalTelemetry& t) {
+    if (!g_telemetryPath[0]) return;
+    char tmpPath[MAX_PATH] = {};
+    std::snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", g_telemetryPath);
+    FILE* f = nullptr;
+    if (fopen_s(&f, tmpPath, "wb") != 0 || !f) return;
+    std::fprintf(f,
+                 "{\n"
+                 "  \"magic\": \"CWPT\",\n"
+                 "  \"version\": %u,\n"
+                 "  \"sequence\": %u,\n"
+                 "  \"timeSeconds\": %.3f,\n"
+                 "  \"realDistance\": %.3f,\n"
+                 "  \"targetDistance\": %.3f,\n"
+                 "  \"planarDistance\": %.3f,\n"
+                 "  \"threeDimensionalDistance\": %.3f,\n"
+                 "  \"player\": {\"x\": %.3f, \"y\": %.3f, \"z\": %.3f},\n"
+                 "  \"playerVelocity\": {\"x\": %.3f, \"y\": %.3f, \"z\": %.3f},\n"
+                 "  \"playerSpeed\": %.3f,\n"
+                 "  \"playerHorizontalSpeed\": %.3f,\n"
+                 "  \"playerFacing\": {\"x\": %.5f, \"y\": %.5f, \"z\": %.5f},\n"
+                 "  \"playerMoveDirection\": {\"x\": %.5f, \"y\": %.5f, \"z\": %.5f},\n"
+                 "  \"playerYaw\": %.5f,\n"
+                 "  \"playerPitch\": %.5f,\n"
+                 "  \"target\": {\"x\": %.3f, \"y\": %.3f, \"z\": %.3f},\n"
+                 "  \"targetCell\": {\"x\": %d, \"y\": %d, \"z\": %d},\n"
+                 "  \"worldSize\": %d,\n"
+                 "  \"signalReached\": %.3f\n"
+                 "}\n",
+                 t.version, t.sequence, t.timeSeconds, t.realDistance, t.targetDistance, t.planarDistance,
+                 t.threeDimensionalDistance, t.playerX, t.playerY, t.playerZ, t.playerVelocityX,
+                 t.playerVelocityY, t.playerVelocityZ, t.playerSpeed, t.playerHorizontalSpeed,
+                 t.playerFacingX, t.playerFacingY, t.playerFacingZ, t.playerMoveDirX, t.playerMoveDirY,
+                 t.playerMoveDirZ, t.playerYaw, t.playerPitch, t.targetX, t.targetY, t.targetZ,
+                 t.targetCellX, t.targetCellY, t.targetCellZ, t.worldSize, t.signalReached);
+    std::fclose(f);
+    MoveFileExA(tmpPath, g_telemetryPath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+}
+
+static void updateTelemetry(float dt) {
+    Vec3 target = cellCenter(g_targetCell.x, g_targetCell.y, g_targetCell.z);
+    float dx = g_pos.x - target.x;
+    float dy = g_pos.y - target.y;
+    float dz = g_pos.z - target.z;
+    float invDt = dt > 0.0001f && g_hasTelemetryPlayer ? 1.0f / dt : 0.0f;
+    Vec3 velocity{
+        (g_pos.x - g_lastTelemetryPlayer.x) * invDt,
+        (g_pos.y - g_lastTelemetryPlayer.y) * invDt,
+        (g_pos.z - g_lastTelemetryPlayer.z) * invDt
+    };
+    Vec3 facing = forward();
+    float horizontalSpeed = std::sqrt(velocity.x * velocity.x + velocity.z * velocity.z);
+    Vec3 moveDir{0.0f, 0.0f, 0.0f};
+    if (horizontalSpeed > 0.001f) moveDir = {velocity.x / horizontalSpeed, 0.0f, velocity.z / horizontalSpeed};
+
+    SignalTelemetry t{};
+    t.magic = kTelemetryMagic;
+    t.version = 1;
+    t.byteSize = sizeof(SignalTelemetry);
+    t.sequence = g_telemetry ? g_telemetry->sequence + 1u : 1u;
+    t.timeSeconds = g_time;
+    t.planarDistance = std::sqrt(dx * dx + dz * dz);
+    t.threeDimensionalDistance = std::sqrt(dx * dx + dy * dy + dz * dz);
+    t.realDistance = t.threeDimensionalDistance;
+    t.targetDistance = t.threeDimensionalDistance;
+    t.playerX = g_pos.x;
+    t.playerY = g_pos.y;
+    t.playerZ = g_pos.z;
+    t.playerVelocityX = velocity.x;
+    t.playerVelocityY = velocity.y;
+    t.playerVelocityZ = velocity.z;
+    t.playerSpeed = std::sqrt(velocity.x * velocity.x + velocity.y * velocity.y + velocity.z * velocity.z);
+    t.playerHorizontalSpeed = horizontalSpeed;
+    t.playerFacingX = facing.x;
+    t.playerFacingY = facing.y;
+    t.playerFacingZ = facing.z;
+    t.playerMoveDirX = moveDir.x;
+    t.playerMoveDirY = moveDir.y;
+    t.playerMoveDirZ = moveDir.z;
+    t.playerYaw = g_yaw;
+    t.playerPitch = g_pitch;
+    t.targetX = target.x;
+    t.targetY = target.y;
+    t.targetZ = target.z;
+    t.targetCellX = g_targetCell.x;
+    t.targetCellY = g_targetCell.y;
+    t.targetCellZ = g_targetCell.z;
+    t.worldSize = g_worldN;
+    t.signalReached = g_reached ? 1.0f : 0.0f;
+    if (g_telemetry) *g_telemetry = t;
+    g_lastTelemetryPlayer = g_pos;
+    g_hasTelemetryPlayer = true;
+
+    g_telemetryFileTimer += dt;
+    if (g_telemetryFileTimer >= 0.25f) {
+        g_telemetryFileTimer = 0.0f;
+        writeTelemetryFile(t);
+    }
+}
+
+static void shutdownTelemetry() {
+    if (g_telemetry) {
+        g_telemetry->sequence += 1u;
+        g_telemetry->signalReached = -1.0f;
+        UnmapViewOfFile(g_telemetry);
+        g_telemetry = nullptr;
+    }
+    if (g_telemetryMapping) {
+        CloseHandle(g_telemetryMapping);
+        g_telemetryMapping = nullptr;
+    }
+}
 
 static void generateWorld() {
     g_worldN = 32 + static_cast<int>(timeGetTime() % 33u);
@@ -864,8 +1045,18 @@ static void updateMouse() {
     RECT rc; GetClientRect(g_hwnd, &rc);
     POINT center{(rc.right-rc.left)/2,(rc.bottom-rc.top)/2}; ClientToScreen(g_hwnd,&center);
     POINT p; GetCursorPos(&p);
+    if (!g_mousePrimed || g_mouseIgnoreFrames > 0) {
+        SetCursorPos(center.x, center.y);
+        g_mousePrimed = true;
+        if (g_mouseIgnoreFrames > 0) --g_mouseIgnoreFrames;
+        return;
+    }
     int dx = p.x - center.x, dy = p.y - center.y;
-    if (dx || dy) { g_yaw += dx * 0.0022f; g_pitch = clampf(g_pitch - dy * 0.0020f, -1.45f, 1.45f); SetCursorPos(center.x, center.y); }
+    if (std::abs(dx) > (rc.right - rc.left) / 4 || std::abs(dy) > (rc.bottom - rc.top) / 4) {
+        SetCursorPos(center.x, center.y);
+        return;
+    }
+    if (dx || dy) { g_yaw = wrapAngle(g_yaw + dx * 0.0022f); g_pitch = clampf(g_pitch - dy * 0.0020f, -1.45f, 1.45f); SetCursorPos(center.x, center.y); }
 }
 static bool playerFitsRadius(Vec3 p, float r) {
     float foot = p.y - kEye + 0.16f;
@@ -1044,6 +1235,7 @@ static void update(float dt) {
         g_yaw = 3.14159265f;
         g_pitch = -0.55f;
     }
+    updateTelemetry(dt);
 }
 
 static void render() {
@@ -1141,8 +1333,8 @@ static LRESULT CALLBACK wndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CLOSE: g_running = false; PostQuitMessage(0); return 0;
     case WM_SIZE: g_width = std::max(1, static_cast<int>(LOWORD(lp))); g_height = std::max(1, static_cast<int>(HIWORD(lp))); return 0;
-    case WM_SETFOCUS: g_focused = true; return 0;
-    case WM_KILLFOCUS: g_focused = false; return 0;
+    case WM_SETFOCUS: g_focused = true; g_mousePrimed = false; g_mouseIgnoreFrames = 8; return 0;
+    case WM_KILLFOCUS: g_focused = false; g_mousePrimed = false; g_mouseIgnoreFrames = 8; return 0;
     case WM_LBUTTONDOWN: g_mouseCaptured = true; ShowCursor(FALSE); g_mineRequest = true; return 0;
     case WM_KEYDOWN:
         if (wp == VK_ESCAPE) {
@@ -1169,12 +1361,18 @@ static bool createContext() {
         wglMakeCurrent(nullptr, nullptr); wglDeleteContext(temp); wglMakeCurrent(g_hdc, g_glrc);
     } else g_glrc = temp;
     ShowCursor(FALSE);
+    RECT client{};
+    GetClientRect(g_hwnd, &client);
+    POINT center{(client.right - client.left) / 2, (client.bottom - client.top) / 2};
+    ClientToScreen(g_hwnd, &center);
+    SetCursorPos(center.x, center.y);
     QueryPerformanceFrequency(&g_frequency); QueryPerformanceCounter(&g_lastCounter);
     return g_glrc != nullptr;
 }
 int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
     timeBeginPeriod(1);
     if (!createContext() || !initRenderer()) return 1;
+    initTelemetry();
     MSG msg{};
     while (g_running) {
         while (PeekMessage(&msg,nullptr,0,0,PM_REMOVE)) { TranslateMessage(&msg); DispatchMessage(&msg); }
@@ -1183,6 +1381,7 @@ int WINAPI WinMain(HINSTANCE, HINSTANCE, LPSTR, int) {
         g_lastCounter = now; dt = clampf(dt, 0.0f, 0.05f); g_time += dt;
         update(dt); render();
     }
+    shutdownTelemetry();
     timeEndPeriod(1);
     return 0;
 }

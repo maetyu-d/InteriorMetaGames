@@ -80,6 +80,15 @@ The Endless Airport Gate also publishes player telemetry for external games and 
 - `currentGate`, `realGate`, `gate47.stage`, `gate47.finalStage`, and `gate47.found` expose the loop/progression state
 - Player position, velocity, speed, facing, move direction, yaw, pitch, and grounded state match the other games
 
+Cube World Path publishes hidden player and target telemetry for external games and tools.
+
+- Named shared memory: `Local\CubeWorldPathTelemetry`
+- Sidecar JSON file: `build\CubeWorldPathTelemetry.json`
+- `realDistance` and `targetDistance` are the 3D world-unit distance from the player to the true bottom-face target
+- `planarDistance` is the horizontal X/Z distance to the target
+- `player`, `playerVelocity`, `playerSpeed`, `playerHorizontalSpeed`, `playerFacing`, `playerYaw`, `playerPitch`, and `playerMoveDirection` match the other games
+- `target`, `targetCell`, `worldSize`, and `signalReached` expose the generated cube target state without showing it in-game
+
 ## Graphics Implementation
 
 - OpenGL 3.3 core-profile context created with WGL
