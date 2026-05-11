@@ -119,15 +119,22 @@ static int g_mineChunk = 0;
 static IVec3 g_breakCell{-1, -1, -1};
 static Vec3 g_breakDir{0.0f, 0.0f, 1.0f};
 static float g_breakBurst = 0.0f;
+static float g_atomicTime = -1000.0f;
+static Vec3 g_atomicOrigin{0.0f, 0.0f, 0.0f};
+static Vec3 g_atomicNormal{1.0f, 0.0f, 0.0f};
+static bool g_atomicTestKeyWasDown = false;
+static bool g_atomicEnded = false;
 
 static GLuint g_program = 0, g_vao = 0, g_vbo = 0;
+static GLuint g_atomicVao = 0, g_atomicVbo = 0;
 static GLuint g_skyProgram = 0, g_skyVao = 0, g_skyVbo = 0;
 static GLuint g_overlayProgram = 0;
 static GLuint g_lineVao = 0, g_lineVbo = 0;
 static GLint g_uMvp = -1, g_uEye = -1, g_uTime = -1, g_uHealth = -1, g_uGlowPass = -1;
-static GLint g_skyTime = -1, g_skyHealth = -1, g_skyResolution = -1;
-static GLint g_overlayTime = -1, g_overlayHealth = -1, g_overlayResolution = -1, g_overlayMine = -1;
+static GLint g_skyTime = -1, g_skyHealth = -1, g_skyResolution = -1, g_skyAtomic = -1;
+static GLint g_overlayTime = -1, g_overlayHealth = -1, g_overlayResolution = -1, g_overlayMine = -1, g_overlayAtomic = -1;
 static std::vector<Vertex> g_mesh;
+static std::vector<Vertex> g_atomicMesh;
 static std::vector<Vertex> g_highlight;
 static std::vector<Vertex> g_debris;
 static bool g_meshDirty = true;
@@ -143,7 +150,9 @@ static constexpr float kPlayerRadius = 0.245f;
 static constexpr float kGravity = 30.0f;
 static constexpr float kMaxFallSpeed = 24.0f;
 static constexpr float kDropCommitSpeed = 9.0f;
+static constexpr float kAtomicDropSeconds = 2.4f;
 static constexpr uint32_t kTelemetryMagic = 0x43575054u; // CWPT
+static constexpr float kTelemetryFileInterval = 2.0f;
 enum Block : uint8_t { Air = 0, Soft = 1, Rock = 2, Uranium = 3, Target = 4 };
 static int g_worldN = 32;
 static std::vector<uint8_t> g_blocks;
@@ -155,6 +164,10 @@ static float g_yaw = 0.0f;
 static float g_pitch = 0.0f;
 
 static float clampf(float v, float lo, float hi) { return std::max(lo, std::min(v, hi)); }
+static float smoothstep(float a, float b, float x) {
+    float t = clampf((x - a) / (b - a), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
 static Vec3 add(Vec3 a, Vec3 b) { return {a.x + b.x, a.y + b.y, a.z + b.z}; }
 static Vec3 sub(Vec3 a, Vec3 b) { return {a.x - b.x, a.y - b.y, a.z - b.z}; }
 static Vec3 mul(Vec3 a, float s) { return {a.x * s, a.y * s, a.z * s}; }
@@ -195,6 +208,19 @@ static IVec3 worldToCell(Vec3 p) {
     };
 }
 static bool solid(uint8_t b) { return b == Soft || b == Rock || b == Uranium; }
+static float atomicIntensity() {
+    if (g_atomicTime < 0.0f) return 0.0f;
+    float t = g_atomicTime - kAtomicDropSeconds;
+    if (t < 0.0f) return smoothstep(0.0f, kAtomicDropSeconds, g_atomicTime) * 0.34f;
+    float flash = smoothstep(6.0f, 0.0f, t);
+    float aftermath = smoothstep(0.2f, 4.0f, t) * smoothstep(40.0f, 7.0f, t) * 0.92f;
+    return clampf(flash + aftermath, 0.0f, 1.0f);
+}
+static float atomicEndFade() {
+    if (g_atomicTime < 0.0f) return 0.0f;
+    float t = g_atomicTime - kAtomicDropSeconds;
+    return t <= 10.0f ? 0.0f : smoothstep(10.0f, 16.0f, t);
+}
 
 static Mat4 identity() { Mat4 r{}; r.m[0]=r.m[5]=r.m[10]=r.m[15]=1.0f; return r; }
 static Mat4 multiply(Mat4 a, Mat4 b) {
@@ -221,6 +247,7 @@ static Vec3 forward() {
     return norm({std::sin(g_yaw) * cp, std::sin(g_pitch), std::cos(g_yaw) * cp});
 }
 static bool footBlocked(Vec3 p);
+static bool keyDown(int vk);
 
 static void initTelemetry() {
     g_telemetryMapping = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
@@ -285,7 +312,7 @@ static void writeTelemetryFile(const SignalTelemetry& t) {
                  t.playerMoveDirZ, t.playerYaw, t.playerPitch, t.targetX, t.targetY, t.targetZ,
                  t.targetCellX, t.targetCellY, t.targetCellZ, t.worldSize, t.signalReached);
     std::fclose(f);
-    MoveFileExA(tmpPath, g_telemetryPath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    MoveFileExA(tmpPath, g_telemetryPath, MOVEFILE_REPLACE_EXISTING);
 }
 
 static void updateTelemetry(float dt) {
@@ -343,7 +370,7 @@ static void updateTelemetry(float dt) {
     g_hasTelemetryPlayer = true;
 
     g_telemetryFileTimer += dt;
-    if (g_telemetryFileTimer >= 0.25f) {
+    if (g_telemetryFileTimer >= kTelemetryFileInterval) {
         g_telemetryFileTimer = 0.0f;
         writeTelemetryFile(t);
     }
@@ -519,6 +546,9 @@ static void generateWorld() {
     g_pitch = -0.55f;
     g_verticalVelocity = 0.0f;
     g_grounded = true;
+    g_atomicTime = -1000.0f;
+    g_atomicTestKeyWasDown = false;
+    g_atomicEnded = false;
 }
 
 static bool rayCell(IVec3& out, uint8_t& block);
@@ -539,6 +569,33 @@ static void addFace(Vec3 p, int face, Vec3 color, float kind) {
         g_mesh.push_back({v, n[face], color, kind + static_cast<float>(face) * 0.03125f});
     }
 }
+static void addAtomicFace(Vec3 p, Vec3 u, Vec3 v, Vec3 n, Vec3 color, float kind) {
+    g_atomicMesh.push_back({p, n, color, kind});
+    g_atomicMesh.push_back({add(add(p, u), v), n, color, kind});
+    g_atomicMesh.push_back({add(p, u), n, color, kind});
+    g_atomicMesh.push_back({p, n, color, kind});
+    g_atomicMesh.push_back({add(p, v), n, color, kind});
+    g_atomicMesh.push_back({add(add(p, u), v), n, color, kind});
+}
+static void addAtomicCube(Vec3 c, Vec3 u, Vec3 v, Vec3 w, float half, Vec3 color, float kind) {
+    u = mul(norm(u), half);
+    v = mul(norm(v), half);
+    w = mul(norm(w), half);
+    Vec3 p000 = sub(sub(sub(c, u), v), w);
+    Vec3 p001 = add(sub(sub(c, u), v), w);
+    Vec3 p010 = sub(add(sub(c, u), v), w);
+    Vec3 p011 = add(add(sub(c, u), v), w);
+    Vec3 p100 = sub(sub(add(c, u), v), w);
+    Vec3 p101 = add(sub(add(c, u), v), w);
+    Vec3 p110 = sub(add(add(c, u), v), w);
+    Vec3 p111 = add(add(add(c, u), v), w);
+    addAtomicFace(p100, sub(p101, p100), sub(p110, p100), norm(u), color, kind + 0.00000f);
+    addAtomicFace(p001, sub(p000, p001), sub(p011, p001), mul(norm(u), -1.0f), color, kind + 0.03125f);
+    addAtomicFace(p010, sub(p110, p010), sub(p011, p010), norm(v), color, kind + 0.06250f);
+    addAtomicFace(p001, sub(p101, p001), sub(p000, p001), mul(norm(v), -1.0f), color, kind + 0.09375f);
+    addAtomicFace(p101, sub(p001, p101), sub(p111, p101), norm(w), color, kind + 0.12500f);
+    addAtomicFace(p000, sub(p100, p000), sub(p010, p000), mul(norm(w), -1.0f), color, kind + 0.15625f);
+}
 static void addHighlightLine(Vec3 a, Vec3 b, Vec3 color, float kind) {
     g_highlight.push_back({a, {0, 1, 0}, color, kind});
     g_highlight.push_back({b, {0, 1, 0}, color, kind});
@@ -547,10 +604,171 @@ static void addDebrisLine(Vec3 a, Vec3 b, Vec3 color, float kind) {
     g_debris.push_back({a, {0, 1, 0}, color, kind});
     g_debris.push_back({b, {0, 1, 0}, color, kind});
 }
+static void addDebrisBox(Vec3 c, Vec3 u, Vec3 v, Vec3 w, float half, Vec3 color, float kind) {
+    Vec3 p[8] = {
+        sub(sub(sub(c, mul(u, half)), mul(v, half)), mul(w, half)),
+        add(sub(sub(c, mul(v, half)), mul(w, half)), mul(u, half)),
+        add(add(sub(c, mul(w, half)), mul(u, half)), mul(v, half)),
+        add(sub(add(c, mul(v, half)), mul(w, half)), mul(u, -half)),
+        add(sub(sub(c, mul(u, half)), mul(v, half)), mul(w, half)),
+        add(add(sub(c, mul(v, half)), mul(u, half)), mul(w, half)),
+        add(add(add(c, mul(u, half)), mul(v, half)), mul(w, half)),
+        add(add(sub(c, mul(u, half)), mul(v, half)), mul(w, half))
+    };
+    int e[12][2] = {{0,1},{1,2},{2,3},{3,0},{4,5},{5,6},{6,7},{7,4},{0,4},{1,5},{2,6},{3,7}};
+    for (auto& edge : e) addDebrisLine(p[edge[0]], p[edge[1]], color, kind);
+}
 static Vec3 facePoint(Vec3 p, int axis, float sign, float u, float v, float s) {
     if (axis == 0) return {p.x + sign * s, p.y + u * s, p.z + v * s};
     if (axis == 1) return {p.x + u * s, p.y + sign * s, p.z + v * s};
     return {p.x + u * s, p.y + v * s, p.z + sign * s};
+}
+static void triggerAtomicBlast() {
+    float half = worldHalf();
+    IVec3 start = g_route.empty() ? IVec3{g_worldN / 2, g_worldN - 2, g_worldN / 2} : g_route.front();
+    Vec3 startWorld = cellCenter(start.x, start.y, start.z);
+    int choice = static_cast<int>(rand01(static_cast<int>(g_time * 10.0f) + g_worldN, start.x, start.z) * 4.0f) & 3;
+    float insetA = (rand01(choice + start.x, g_worldN, 41) - 0.5f) * half * 0.70f;
+    float y = clampf(startWorld.y - half * (0.18f + rand01(choice, start.y, 52) * 0.46f), -half * 0.72f, half * 0.52f);
+    if (choice == 0) {
+        g_atomicNormal = {1, 0, 0};
+        g_atomicOrigin = {half + 0.10f, y, clampf(startWorld.z + insetA, -half * 0.70f, half * 0.70f)};
+    } else if (choice == 1) {
+        g_atomicNormal = {-1, 0, 0};
+        g_atomicOrigin = {-half - 0.10f, y, clampf(startWorld.z + insetA, -half * 0.70f, half * 0.70f)};
+    } else if (choice == 2) {
+        g_atomicNormal = {0, 0, 1};
+        g_atomicOrigin = {clampf(startWorld.x + insetA, -half * 0.70f, half * 0.70f), y, half + 0.10f};
+    } else {
+        g_atomicNormal = {0, 0, -1};
+        g_atomicOrigin = {clampf(startWorld.x + insetA, -half * 0.70f, half * 0.70f), y, -half - 0.10f};
+    }
+    g_atomicTime = 0.0f;
+    g_mineFlash = std::max(g_mineFlash, 0.55f);
+    g_mineImpact = std::max(g_mineImpact, 0.50f);
+}
+static void updateAtomicBlast(float dt) {
+    bool testKeyDown = keyDown('T');
+    if (testKeyDown && !g_atomicTestKeyWasDown) triggerAtomicBlast();
+    g_atomicTestKeyWasDown = testKeyDown;
+    if (g_atomicTime > -100.0f) {
+        g_atomicTime += dt;
+        float a = atomicIntensity();
+        if (a > 0.02f) {
+            g_mineFlash = std::max(g_mineFlash, a * 0.82f);
+            g_mineImpact = std::max(g_mineImpact, a * 0.75f);
+        }
+    }
+}
+static void addAtomicRing(Vec3 center, Vec3 u, Vec3 v, float radius, Vec3 color, float kind, int steps = 64) {
+    Vec3 prev = add(center, mul(u, radius));
+    for (int i = 1; i <= steps; ++i) {
+        float a = static_cast<float>(i) / static_cast<float>(steps) * 6.2831853f;
+        Vec3 cur = add(center, add(mul(u, std::cos(a) * radius), mul(v, std::sin(a) * radius)));
+        addDebrisLine(prev, cur, color, kind);
+        prev = cur;
+    }
+}
+static void buildAtomicBlastSolids() {
+    g_atomicMesh.clear();
+    if (g_atomicTime < 0.0f || g_atomicTime > kAtomicDropSeconds + 44.0f) return;
+    Vec3 n = norm(g_atomicNormal);
+    Vec3 u = std::fabs(n.y) < 0.85f ? norm(cross({0,1,0}, n)) : Vec3{1,0,0};
+    Vec3 v = norm(cross(n, u));
+    Vec3 impact = g_atomicOrigin;
+    float t = g_atomicTime - kAtomicDropSeconds;
+    if (t < 0.0f) {
+        float drop = smoothstep(0.0f, kAtomicDropSeconds, g_atomicTime);
+        Vec3 start = add(add(impact, mul(n, 58.0f)), mul(v, 32.0f));
+        Vec3 pos = add(mul(start, 1.0f - drop), mul(add(impact, mul(n, 1.5f)), drop));
+        addAtomicCube(pos, u, v, n, 2.1f, {1.0f, 0.18f, 0.012f}, 4.0f);
+        addAtomicCube(add(pos, mul(n, -3.0f)), u, v, n, 1.35f, {0.24f, 0.025f, 0.010f}, 1.0f);
+        return;
+    }
+    float blast = smoothstep(0.0f, 2.2f, t) * smoothstep(20.0f, 4.0f, t);
+    float flash = smoothstep(3.2f, 0.0f, t);
+    float bloom = smoothstep(0.2f, 5.0f, t) * smoothstep(19.0f, 6.0f, t);
+    float fireR = 14.0f + t * 8.8f;
+    for (int i = 0; i < 132; ++i) {
+        float seed = rand01(i + 4100, 3, 9);
+        float a = seed * 6.2831853f;
+        float r = fireR * (0.15f + rand01(i, 4, 8) * 0.88f);
+        float out = (3.5f + rand01(i, 7, 12) * 28.0f) * (0.70f + blast * 1.75f);
+        Vec3 p = add(impact, add(mul(n, out), add(mul(u, std::cos(a) * r), mul(v, std::sin(a) * r * 0.78f))));
+        float s = (2.4f + seed * 7.8f) * (1.0f + flash * 1.45f);
+        Vec3 c = seed > 0.55f ? Vec3{1.0f, 0.26f + flash * 0.45f, 0.014f} : Vec3{0.55f, 0.055f, 0.010f};
+        addAtomicCube(p, u, v, n, s, c, seed > 0.55f ? 4.0f : 1.0f);
+    }
+    float cloud = smoothstep(0.8f, 10.0f, t);
+    for (int layer = 0; layer < 8; ++layer) {
+        int count = 22 + layer * 10;
+        float layerOut = (14.0f + layer * 9.0f + cloud * 86.0f);
+        float layerR = (14.0f + layer * 12.0f + cloud * 66.0f);
+        for (int i = 0; i < count; ++i) {
+            float seed = rand01(4300 + layer * 97 + i, 6, 2);
+            float a = static_cast<float>(i) / static_cast<float>(count) * 6.2831853f + seed * 0.65f + g_time * 0.025f;
+            Vec3 p = add(impact, add(mul(n, layerOut + seed * 8.0f),
+                         add(mul(u, std::cos(a) * layerR * (0.55f + seed * 0.55f)),
+                             mul(v, std::sin(a) * layerR * 0.72f + (static_cast<float>(layer) - 1.2f) * 4.5f))));
+            float s = 3.3f + seed * 10.0f + cloud * (3.2f + layer * 1.6f);
+            Vec3 ash = layer < 2 ? Vec3{0.46f, 0.10f + bloom * 0.08f, 0.030f} : Vec3{0.18f, 0.055f, 0.030f};
+            ash = {ash.x + flash * 0.30f, ash.y + flash * 0.14f, ash.z + flash * 0.035f};
+            addAtomicCube(p, u, v, n, s, ash, layer < 2 ? 1.0f : 2.0f);
+        }
+    }
+    for (int i = 0; i < 76; ++i) {
+        float seed = rand01(4700 + i, 14, 5);
+        float a = seed * 6.2831853f;
+        Vec3 p = add(impact, add(mul(n, 4.0f + seed * 12.0f), add(mul(u, std::cos(a) * (10.0f + seed * 22.0f)), mul(v, std::sin(a) * (8.0f + seed * 18.0f)))));
+        addAtomicCube(p, u, v, n, 0.9f + seed * 1.5f, {0.04f, 0.90f, 0.035f}, 3.0f);
+    }
+}
+static void buildAtomicBlastLines() {
+    if (g_atomicTime < 0.0f || g_atomicTime > kAtomicDropSeconds + 44.0f) return;
+    Vec3 n = norm(g_atomicNormal);
+    Vec3 u = std::fabs(n.y) < 0.85f ? norm(cross({0,1,0}, n)) : Vec3{1,0,0};
+    Vec3 v = norm(cross(n, u));
+    Vec3 impact = g_atomicOrigin;
+    float y = 1.0f;
+    float t = g_atomicTime - kAtomicDropSeconds;
+    if (t < 0.0f) {
+        float drop = smoothstep(0.0f, kAtomicDropSeconds, g_atomicTime);
+        Vec3 start = add(add(impact, mul(n, 58.0f)), mul(v, 32.0f));
+        Vec3 pos = add(mul(start, 1.0f - drop), mul(add(impact, mul(n, 1.5f)), drop));
+        float pulse = 0.65f + 0.35f * std::sin(g_time * 22.0f);
+        addDebrisBox(pos, u, v, n, 1.35f, {1.0f, 0.26f + pulse * 0.20f, 0.02f}, 1.0f);
+        addDebrisLine(start, pos, {0.72f, 0.12f, 0.02f}, 1.0f);
+        addDebrisLine(add(pos, mul(u, -2.5f)), add(pos, mul(u, 2.5f)), {1.0f, 0.70f, 0.08f}, 1.0f);
+        return;
+    }
+    float blast = smoothstep(0.0f, 2.4f, t) * smoothstep(19.5f, 4.2f, t);
+    float flash = smoothstep(3.0f, 0.0f, t);
+    float radius = (22.0f + t * 23.0f) * (1.0f + blast * 1.55f);
+    Vec3 hot{1.0f + flash * 0.6f, 0.19f + flash * 0.50f, 0.015f};
+    Vec3 ember{0.95f, 0.10f + blast * 0.18f, 0.010f};
+    addAtomicRing(add(impact, mul(n, 0.4f)), u, v, radius, hot, 1.0f, 72);
+    addAtomicRing(add(impact, mul(n, 0.8f)), u, v, radius * 0.62f, {0.55f, 0.04f, 0.008f}, 1.0f, 52);
+    for (int i = 0; i < 190; ++i) {
+        float seed = rand01(i + 2000, 5, 9);
+        float a = seed * 6.2831853f;
+        float r = radius * (0.15f + rand01(i, 8, 12) * 0.92f);
+        Vec3 faceP = add(impact, add(mul(u, std::cos(a) * r), mul(v, std::sin(a) * r)));
+        float len = (8.0f + rand01(i, 17, 4) * 52.0f) * (0.70f + blast * 1.60f);
+        addDebrisLine(faceP, add(faceP, mul(n, len)), i % 3 ? ember : hot, 1.0f);
+    }
+    float cloudRise = smoothstep(0.5f, 9.0f, t);
+    for (int i = 0; i < 150; ++i) {
+        float seed = rand01(i + 3000, 6, 2);
+        float a = seed * 6.2831853f + g_time * 0.035f;
+        float layer = rand01(i, 21, 7);
+        float out = (18.0f + cloudRise * 86.0f) * (0.35f + layer);
+        float side = (8.0f + cloudRise * 54.0f) * (rand01(i, 31, 4) - 0.5f);
+        Vec3 p = add(impact, add(mul(n, out), add(mul(u, std::cos(a) * (7.0f + layer * 22.0f)), mul(v, side + std::sin(a) * (4.0f + layer * 10.0f)))));
+        float s = (1.2f + seed * 3.8f) * (1.0f + cloudRise * 1.1f);
+        Vec3 c = layer > 0.62f ? Vec3{0.30f, 0.08f, 0.025f} : Vec3{0.75f, 0.19f, 0.025f};
+        c = {c.x + flash * 0.55f, c.y + flash * 0.25f, c.z + flash * 0.06f};
+        addDebrisBox(p, u, v, n, s, c, 1.0f);
+    }
 }
 static void rebuildHighlight() {
     g_highlight.clear();
@@ -618,6 +836,7 @@ static void rebuildHighlight() {
             addDebrisLine(start, end, burstColor, 1.0f);
         }
     }
+    buildAtomicBlastLines();
 }
 static Vec3 blockColor(uint8_t b, int x, int y, int z) {
     float r = rand01(x, y, z);
@@ -820,6 +1039,7 @@ static const char* kSkyFs = R"GLSL(
 in vec2 vUv;
 uniform float uTime;
 uniform float uHealth;
+uniform float uAtomic;
 uniform vec3 uResolution;
 out vec4 FragColor;
 float hash(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453123);}
@@ -840,6 +1060,7 @@ void main(){
     q.x*=uResolution.x/max(uResolution.y,1.0);
     float reached=uResolution.z;
     float danger=1.0-uHealth;
+    float atomic=clamp(uAtomic,0.0,1.0);
     vec3 zenith=vec3(0.018,0.003,0.010);
     vec3 high=vec3(0.070,0.010,0.012);
     vec3 low=vec3(0.56,0.055,0.006);
@@ -859,6 +1080,8 @@ void main(){
     float horizon=exp(-abs(uv.y-0.18)*9.0);
     float heat=0.56+0.44*sin(uTime*0.65+uv.x*18.0+smokeA*3.2);
     col += vec3(1.20,0.16,0.018)*horizon*(0.15+0.13*heat);
+    col += vec3(3.4,0.74,0.080)*atomic*(0.44+0.96*horizon);
+    col = mix(col, vec3(1.0,0.78,0.30), atomic*smoothstep(0.92,0.12,uv.y)*0.52);
     col += vec3(0.45,0.035,0.006)*exp(-dot(q-vec2(0.0,-0.28),q-vec2(0.0,-0.28))*3.8)*(0.50+0.30*danger);
     float farFurnace=exp(-dot(q-vec2(0.0,-0.42),q-vec2(0.0,-0.42))*7.0);
     float farRift=pow(max(0.0,1.0-abs(q.x+sin(uv.y*11.0+uTime*0.10)*0.045)*12.0),2.2)*smoothstep(0.03,0.38,uv.y)*(1.0-smoothstep(0.52,0.88,uv.y));
@@ -885,6 +1108,8 @@ void main(){
     col += vec3(0.12,0.075,0.055)*ash*(0.08+0.10*smoke);
     col += vec3(0.18,0.11,0.075)*ashFine*(0.04+0.08*smoothstep(0.25,1.0,uv.y));
     col += vec3(1.00,0.22,0.035)*highCinders*0.20;
+    float fallout=step(0.90-atomic*0.20,hash(floor(vec2(uv.x*uResolution.x*0.18+uTime*8.0,uv.y*uResolution.y*0.18-uTime*28.0))));
+    col += vec3(1.35,0.28,0.050)*fallout*atomic*(0.24+0.32*smoothstep(0.05,0.8,uv.y));
 
     float vignette=smoothstep(0.54,1.16,length(q));
     float murk=smoothstep(0.0,0.62,uv.y)*(1.0-smoothstep(0.70,1.0,uv.y))*smoothstep(0.44,0.92,smoke);
@@ -892,6 +1117,7 @@ void main(){
     vec3 grade=mix(vec3(col.r*1.12,col.g*0.88,col.b*0.78),vec3(col.r*0.92,col.g*1.02,col.b*1.08),smoothstep(0.58,1.0,uv.y));
     col=mix(col,grade,0.18);
     col*=1.0-vignette*0.43;
+    col+=vec3(1.35,0.18,0.020)*atomic*(1.0-vignette*0.25)*0.30;
     col=mix(col, col+vec3(0.28,0.045,0.006), danger*0.32);
     col=mix(col, vec3(0.78,0.13,0.015), reached*(0.18+0.16*horizon));
     col=col/(col+vec3(0.86));
@@ -906,6 +1132,7 @@ in vec2 vUv;
 uniform float uTime;
 uniform float uHealth;
 uniform float uMine;
+uniform float uAtomic;
 uniform vec3 uResolution;
 out vec4 FragColor;
 float hash(vec2 p){return fract(sin(dot(p,vec2(269.5,183.3)))*43758.5453123);}
@@ -923,6 +1150,7 @@ void main(){
     float danger=1.0-uHealth;
     float reached=uResolution.z;
     float mine=clamp(uMine,0.0,1.0);
+    float atomic=clamp(uAtomic,0.0,1.0);
     float drift=fbm(vec2(uv.x*2.0+uTime*0.018,uv.y*1.4-uTime*0.025));
     float veil=smoothstep(0.44,0.95,drift)*smoothstep(0.02,0.78,uv.y);
     float lowerSmoke=exp(-abs(uv.y-0.12)*6.8)*(0.45+0.55*fbm(vec2(uv.x*4.0-uTime*0.045,uv.y*2.0)));
@@ -955,13 +1183,22 @@ void main(){
     color+=vec3(0.16,0.018,0.004)*vignette*(0.22+0.18*danger);
     color+=vec3(0.32,0.055,0.008)*reached*lowerSmoke*0.10;
     color+=vec3(0.34,0.052,0.008)*furnaceHalo*0.055;
+    color+=vec3(2.2,0.48,0.060)*atomic*(0.24+0.42*furnaceHalo)*(1.0-vignette*0.16);
     color+=vec3(0.95,0.14,0.018)*mine*(0.060+0.085*pulse+0.080*mineBeat)*(1.0-vignette*0.35);
     color+=vec3(1.25,0.23,0.040)*biteRing*0.065;
     color+=vec3(1.00,0.34,0.10)*debrisSpray*(0.030+0.075*mine);
     color+=vec3(0.20,0.080,0.030)*scratch*0.070;
     color+=vec3(0.065,0.017,0.005)*smoothstep(0.68,1.0,heatRipple)*lowerSmoke*0.10;
-    color+=vec3(grain)*0.010*(0.65+danger*0.8);
-    float alpha=clamp(veil*0.065+lowerSmoke*0.060+ember*0.16+emberBloom*0.22+ash*0.035+scratch*0.045+furnaceHalo*0.025+mine*0.075+biteRing*0.12+debrisSpray*0.035+vignette*(0.09+danger*0.06),0.0,0.46);
+    color+=vec3(1.25,0.18,0.018)*smoothstep(0.48,1.0,heatRipple)*atomic*0.18;
+    color+=vec3(grain)*0.010*(0.65+danger*0.8+atomic*3.8);
+    float blastRing=smoothstep(0.055,0.0,abs(length(q)-0.18-uAtomic*0.58))*atomic;
+    float secondRing=smoothstep(0.040,0.0,abs(length(q)-0.46-uAtomic*0.34))*atomic;
+    color+=vec3(2.2,0.62,0.12)*blastRing*0.42;
+    color+=vec3(1.4,0.24,0.035)*secondRing*0.24;
+    float alpha=clamp(veil*0.065+lowerSmoke*0.060+ember*0.16+emberBloom*0.22+ash*0.035+scratch*0.045+furnaceHalo*0.025+mine*0.075+biteRing*0.12+debrisSpray*0.035+vignette*(0.09+danger*0.06)+atomic*0.34+blastRing*0.30+secondRing*0.18,0.0,0.86);
+    float endFade=clamp(uResolution.z,0.0,1.0);
+    color=mix(color,vec3(0.0),endFade);
+    alpha=mix(alpha,1.0,endFade);
     FragColor=vec4(color,alpha);
 }
 )GLSL";
@@ -1010,10 +1247,12 @@ static bool initRenderer() {
     g_skyTime = glGetUniformLocation(g_skyProgram, "uTime");
     g_skyHealth = glGetUniformLocation(g_skyProgram, "uHealth");
     g_skyResolution = glGetUniformLocation(g_skyProgram, "uResolution");
+    g_skyAtomic = glGetUniformLocation(g_skyProgram, "uAtomic");
     g_overlayTime = glGetUniformLocation(g_overlayProgram, "uTime");
     g_overlayHealth = glGetUniformLocation(g_overlayProgram, "uHealth");
     g_overlayMine = glGetUniformLocation(g_overlayProgram, "uMine");
     g_overlayResolution = glGetUniformLocation(g_overlayProgram, "uResolution");
+    g_overlayAtomic = glGetUniformLocation(g_overlayProgram, "uAtomic");
     const float skyQuad[] = {
         -1.0f,-1.0f,  1.0f,-1.0f,  1.0f, 1.0f,
         -1.0f,-1.0f,  1.0f, 1.0f, -1.0f, 1.0f
@@ -1024,6 +1263,12 @@ static bool initRenderer() {
     glEnableVertexAttribArray(0); glVertexAttribPointer(0,2,GL_FLOAT,GL_FALSE,2*sizeof(float),reinterpret_cast<void*>(0));
     glGenVertexArrays(1, &g_vao); glGenBuffers(1, &g_vbo);
     glBindVertexArray(g_vao); glBindBuffer(GL_ARRAY_BUFFER, g_vbo);
+    glEnableVertexAttribArray(0); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,sizeof(Vertex),reinterpret_cast<void*>(offsetof(Vertex,p)));
+    glEnableVertexAttribArray(1); glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,sizeof(Vertex),reinterpret_cast<void*>(offsetof(Vertex,n)));
+    glEnableVertexAttribArray(2); glVertexAttribPointer(2,3,GL_FLOAT,GL_FALSE,sizeof(Vertex),reinterpret_cast<void*>(offsetof(Vertex,c)));
+    glEnableVertexAttribArray(3); glVertexAttribPointer(3,1,GL_FLOAT,GL_FALSE,sizeof(Vertex),reinterpret_cast<void*>(offsetof(Vertex,kind)));
+    glGenVertexArrays(1, &g_atomicVao); glGenBuffers(1, &g_atomicVbo);
+    glBindVertexArray(g_atomicVao); glBindBuffer(GL_ARRAY_BUFFER, g_atomicVbo);
     glEnableVertexAttribArray(0); glVertexAttribPointer(0,3,GL_FLOAT,GL_FALSE,sizeof(Vertex),reinterpret_cast<void*>(offsetof(Vertex,p)));
     glEnableVertexAttribArray(1); glVertexAttribPointer(1,3,GL_FLOAT,GL_FALSE,sizeof(Vertex),reinterpret_cast<void*>(offsetof(Vertex,n)));
     glEnableVertexAttribArray(2); glVertexAttribPointer(2,3,GL_FLOAT,GL_FALSE,sizeof(Vertex),reinterpret_cast<void*>(offsetof(Vertex,c)));
@@ -1190,6 +1435,14 @@ static void updateMining(float dt) {
 }
 static void update(float dt) {
     updateMouse();
+    updateAtomicBlast(dt);
+    float endFade = atomicEndFade();
+    if (endFade >= 0.995f) {
+        g_atomicEnded = true;
+        g_mineRequest = false;
+        updateTelemetry(dt);
+        return;
+    }
     bool wasGrounded = g_grounded;
     Vec3 f = forward();
     Vec3 flat = norm({f.x, 0.0f, f.z});
@@ -1239,6 +1492,8 @@ static void update(float dt) {
 }
 
 static void render() {
+    float atomic = atomicIntensity();
+    float endFade = atomicEndFade();
     glViewport(0,0,g_width,g_height);
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
@@ -1247,6 +1502,7 @@ static void render() {
     glUseProgram(g_skyProgram);
     glUniform1f(g_skyTime, g_time);
     glUniform1f(g_skyHealth, g_health);
+    glUniform1f(g_skyAtomic, atomic);
     glUniform3f(g_skyResolution, static_cast<float>(g_width), static_cast<float>(g_height), g_reached ? 1.0f : 0.0f);
     glBindVertexArray(g_skyVao);
     glDrawArrays(GL_TRIANGLES, 0, 6);
@@ -1256,10 +1512,11 @@ static void render() {
     Vec3 fwd = forward();
     Vec3 flat = norm({fwd.x, 0.0f, fwd.z});
     Vec3 right = norm(cross(flat, {0,1,0}));
-    float shake = g_mineImpact * (0.003f + 0.0035f * g_mineProgress) + g_mineFlash * 0.003f;
-    Vec3 renderPos = add(g_pos, add(mul(right, std::sin(g_time * 91.0f) * shake), Vec3{0.0f, std::cos(g_time * 77.0f) * shake * 0.45f, 0.0f}));
+    float shock = atomic * (0.075f + 0.095f * std::sin(g_time * 17.0f) * std::sin(g_time * 41.0f));
+    float shake = g_mineImpact * (0.003f + 0.0035f * g_mineProgress) + g_mineFlash * 0.003f + shock;
+    Vec3 renderPos = add(g_pos, add(mul(right, std::sin(g_time * 91.0f) * shake), Vec3{0.0f, std::cos(g_time * 77.0f) * shake * (0.45f + atomic * 4.0f), 0.0f}));
     Mat4 view = lookAt(renderPos, add(renderPos, fwd), {0,1,0});
-    Mat4 proj = perspective(72.0f + g_mineImpact * 0.225f + g_mineFlash * 0.325f, static_cast<float>(g_width) / std::max(1, g_height), 0.04f, 130.0f);
+    Mat4 proj = perspective(72.0f + g_mineImpact * 0.225f + g_mineFlash * 0.325f + atomic * 18.0f, static_cast<float>(g_width) / std::max(1, g_height), 0.04f, 220.0f);
     Mat4 mvp = multiply(proj, view);
     glUseProgram(g_program);
     glUniformMatrix4fv(g_uMvp, 1, GL_FALSE, mvp.m);
@@ -1274,11 +1531,24 @@ static void render() {
         g_meshDirty = false;
     }
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(g_mesh.size()));
+    buildAtomicBlastSolids();
+    if (!g_atomicMesh.empty()) {
+        glBindVertexArray(g_atomicVao);
+        glBindBuffer(GL_ARRAY_BUFFER, g_atomicVbo);
+        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(g_atomicMesh.size() * sizeof(Vertex)), g_atomicMesh.data(), GL_DYNAMIC_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(g_atomicMesh.size()));
+    }
+    glBindVertexArray(g_vao);
     glEnable(GL_BLEND);
     glBlendFunc(GL_SRC_ALPHA, GL_ONE);
     glDepthMask(GL_FALSE);
     glUniform1f(g_uGlowPass, 1.0f);
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(g_mesh.size()));
+    if (!g_atomicMesh.empty()) {
+        glBindVertexArray(g_atomicVao);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(g_atomicMesh.size()));
+        glBindVertexArray(g_vao);
+    }
     glUniform1f(g_uGlowPass, 0.0f);
     glDepthMask(GL_TRUE);
     glDisable(GL_BLEND);
@@ -1290,7 +1560,8 @@ static void render() {
     glUniform1f(g_overlayTime, g_time);
     glUniform1f(g_overlayHealth, g_health);
     glUniform1f(g_overlayMine, std::max(std::max(g_mineProgress, g_mineFlash * 0.95f), g_mineImpact * 0.70f));
-    glUniform3f(g_overlayResolution, static_cast<float>(g_width), static_cast<float>(g_height), g_reached ? 1.0f : 0.0f);
+    glUniform1f(g_overlayAtomic, atomic);
+    glUniform3f(g_overlayResolution, static_cast<float>(g_width), static_cast<float>(g_height), endFade);
     glBindVertexArray(g_skyVao);
     glDrawArrays(GL_TRIANGLES, 0, 6);
     glDisable(GL_BLEND);

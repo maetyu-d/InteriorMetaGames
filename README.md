@@ -14,6 +14,7 @@ It also contains **Cube World Path**, a fourth first-person mining game set on a
 - `Shift` - move faster
 - `Space` - jump
 - Left mouse - mine the highlighted block in Cube World Path
+- `T` - test-trigger the atomic blast in Dead Channel and Cube World Path
 - `E` - drink at oasis water in The White Figure
 - `Q` - use the water-powered jetpack in The White Figure
 - Left mouse - fire weapon in The White Figure
@@ -61,6 +62,14 @@ Dead Channel does not show the real signal distance to the player, but it publis
 - `playerFacing`, `playerYaw`, and `playerPitch` expose camera/look direction
 - `playerMoveDirection` exposes normalized horizontal movement direction, or zero while still
 - `visibleTowerZ`, `falseStartStage`, and `finalStage` expose the current decoy/progression state without changing the in-game display
+
+Dead Channel can also accept an external atomic-blast trigger without showing any extra UI to the player.
+
+- Named shared memory: `Local\DeadChannelAtomicControl`
+- Packed control struct fields: `magic` (`0x44434142`), `version`, `byteSize`, `triggerSequence`, `bombX`, `bombZ`, and `yieldScale`
+- Increment `triggerSequence` to detonate a distant blast; `yieldScale` is clamped by the game, and `bombX`/`bombZ` of `0 0` lets Dead Channel choose a far-away position ahead of the player
+- Sidecar trigger file: `build\DeadChannelAtomicTrigger.txt`
+- The trigger file format is an increasing sequence number, optionally followed by X, Z, and yield, for example `7 420 -1800 1.4`
 
 The White Figure publishes the same hidden-player telemetry contract for external games and tools.
 

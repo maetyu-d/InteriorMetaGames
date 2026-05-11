@@ -183,6 +183,10 @@ static float g_incomingDirY = 0.0f;
 static float g_playerHealth = 1.0f;
 static float g_sniperTimer = 0.0f;
 static bool g_fireRequested = false;
+static float g_atomicTime = -1000.0f;
+static Vec3 g_atomicOrigin{0.0f, 0.0f, 0.0f};
+static bool g_atomicTestKeyWasDown = false;
+static bool g_atomicEnded = false;
 static bool g_leftEyeDestroyed = false;
 static bool g_rightEyeDestroyed = false;
 static int g_chestHits = 0;
@@ -197,6 +201,8 @@ static GLuint g_sceneProgram = 0;
 static GLuint g_postProgram = 0;
 static GLuint g_sceneVao = 0;
 static GLuint g_sceneVbo = 0;
+static GLuint g_atomicVao = 0;
+static GLuint g_atomicVbo = 0;
 static GLuint g_lineVao = 0;
 static GLuint g_lineVbo = 0;
 static GLuint g_fxLineVao = 0;
@@ -207,6 +213,7 @@ static GLuint g_fbo = 0;
 static GLuint g_colorTex = 0;
 static GLuint g_depthRb = 0;
 static std::vector<Vertex> g_triangles;
+static std::vector<Vertex> g_atomicTriangles;
 static std::vector<Vertex> g_lines;
 static std::vector<Vertex> g_frameLines;
 static std::vector<Aabb> g_buildingColliders;
@@ -244,6 +251,8 @@ struct PostUniforms {
     GLint damagePulse = -1;
     GLint health = -1;
     GLint incomingDir = -1;
+    GLint atomic = -1;
+    GLint atomicFade = -1;
     GLint resolution = -1;
 };
 static SceneUniforms g_sceneUniforms;
@@ -259,7 +268,9 @@ static constexpr float kPlayerEyeHeight = 5.8f;
 static constexpr float kPlayerFootRadius = 1.35f;
 static constexpr float kPlayerGroundClearance = 0.38f;
 static constexpr float kTerrainMeshStep = 22.0f;
+static constexpr float kAtomicDropSeconds = 3.0f;
 static constexpr uint32_t kTelemetryMagic = 0x57464847u; // WFHG
+static constexpr float kTelemetryFileInterval = 2.0f;
 
 static float clampf(float v, float lo, float hi) { return std::max(lo, std::min(v, hi)); }
 static float lerp(float a, float b, float t) { return a + (b - a) * t; }
@@ -277,6 +288,25 @@ static Vec3 cross(Vec3 a, Vec3 b) {
 static Vec3 norm(Vec3 v) {
     float l = std::sqrt(std::max(0.000001f, dot(v, v)));
     return {v.x / l, v.y / l, v.z / l};
+}
+static bool keyDown(int vk);
+static float atomicIntensity() {
+    if (g_atomicTime < 0.0f) return 0.0f;
+    float t = g_atomicTime - kAtomicDropSeconds;
+    if (t < 0.0f) return smoothstep(0.0f, kAtomicDropSeconds, g_atomicTime) * 0.22f;
+    float flash = smoothstep(6.5f, 0.0f, t);
+    float furnace = smoothstep(0.3f, 4.2f, t) * smoothstep(42.0f, 7.0f, t) * 0.92f;
+    return clampf(flash + furnace, 0.0f, 1.0f);
+}
+static float atomicEndFade() {
+    if (g_atomicTime < 0.0f) return 0.0f;
+    float t = g_atomicTime - kAtomicDropSeconds;
+    return t <= 12.0f ? 0.0f : smoothstep(12.0f, 19.0f, t);
+}
+static float atomicFinalConvulsion() {
+    if (g_atomicTime < 0.0f) return 0.0f;
+    float t = g_atomicTime - kAtomicDropSeconds;
+    return smoothstep(9.5f, 14.0f, t) * (1.0f - smoothstep(18.5f, 22.0f, t));
 }
 
 static uint32_t hash2(int x, int z) {
@@ -497,7 +527,7 @@ static void writeTelemetryFile(const SignalTelemetry& t) {
                  t.rightEyeDestroyed ? "true" : "false", t.chestHits, t.requiredChestHits,
                  t.colossusDefeated ? "true" : "false");
     std::fclose(f);
-    MoveFileExA(tmpPath, g_telemetryPath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    MoveFileExA(tmpPath, g_telemetryPath, MOVEFILE_REPLACE_EXISTING);
 }
 
 static void updateTelemetry(float dt) {
@@ -574,7 +604,7 @@ static void updateTelemetry(float dt) {
     g_hasTelemetryPlayer = true;
 
     g_telemetryFileTimer += dt;
-    if (g_telemetryFileTimer >= 0.25f) {
+    if (g_telemetryFileTimer >= kTelemetryFileInterval) {
         g_telemetryFileTimer = 0.0f;
         writeTelemetryFile(t);
     }
@@ -635,6 +665,12 @@ static void pushTri(Vec3 a, Vec3 b, Vec3 c, Vec3 color, float shine) {
     g_triangles.push_back({b, n, color, shine});
     g_triangles.push_back({c, n, color, shine});
 }
+static void pushAtomicTri(Vec3 a, Vec3 b, Vec3 c, Vec3 color, float shine) {
+    Vec3 n = norm(cross(sub(b, a), sub(c, a)));
+    g_atomicTriangles.push_back({a, n, color, shine});
+    g_atomicTriangles.push_back({b, n, color, shine});
+    g_atomicTriangles.push_back({c, n, color, shine});
+}
 static void pushTriSmooth(Vec3 a, Vec3 b, Vec3 c, Vec3 na, Vec3 nb, Vec3 nc, Vec3 color, float shine) {
     g_triangles.push_back({a, na, color, shine});
     g_triangles.push_back({b, nb, color, shine});
@@ -643,6 +679,32 @@ static void pushTriSmooth(Vec3 a, Vec3 b, Vec3 c, Vec3 na, Vec3 nb, Vec3 nc, Vec
 static void pushLine(Vec3 a, Vec3 b, Vec3 color, float shine = 0.5f) {
     g_lines.push_back({a, {0, 1, 0}, color, shine});
     g_lines.push_back({b, {0, 1, 0}, color, shine});
+}
+static void pushFrameLine(Vec3 a, Vec3 b, Vec3 color, float shine = 0.5f) {
+    g_frameLines.push_back({a, {0, 1, 0}, color, shine});
+    g_frameLines.push_back({b, {0, 1, 0}, color, shine});
+}
+static void pushAtomicBillboard(Vec3 center, float width, float height, Vec3 color, float shine) {
+    Vec3 toPlayer = norm(sub(g_player, center));
+    Vec3 right = norm(cross({0.0f, 1.0f, 0.0f}, toPlayer));
+    Vec3 up{0.0f, 1.0f, 0.0f};
+    Vec3 r = mul(right, width * 0.5f);
+    Vec3 u = mul(up, height * 0.5f);
+    Vec3 a = sub(sub(center, r), u);
+    Vec3 b = add(sub(center, u), r);
+    Vec3 c = add(add(center, r), u);
+    Vec3 d = add(sub(center, r), u);
+    pushAtomicTri(a, b, c, color, shine);
+    pushAtomicTri(a, c, d, color, shine);
+}
+static void pushAtomicRing(Vec3 center, float radius, Vec3 color, float shine, int steps = 128) {
+    Vec3 prev{center.x + radius, center.y, center.z};
+    for (int i = 1; i <= steps; ++i) {
+        float a = static_cast<float>(i) / static_cast<float>(steps) * 6.2831853f;
+        Vec3 cur{center.x + std::cos(a) * radius, center.y, center.z + std::sin(a) * radius};
+        pushFrameLine(prev, cur, color, shine);
+        prev = cur;
+    }
 }
 static void addSniper(int id, Vec3 pos);
 static void pushCube(Vec3 center, Vec3 scale, Vec3 color, float shine, float yaw = 0.0f) {
@@ -1114,6 +1176,90 @@ static void buildTower() {
         }
     }
 }
+static void triggerAtomicBlast() {
+    Vec3 p = sightingPositionForStage(kFinalSignalStage);
+    float ground = renderedSurfaceHeight(p.x, p.z);
+    g_atomicOrigin = {p.x + 140.0f, ground, p.z + 90.0f};
+    g_atomicTime = 0.0f;
+    g_atomicEnded = false;
+    g_damagePulse = std::max(g_damagePulse, 0.70f);
+    g_hitPulse = std::max(g_hitPulse, 0.55f);
+}
+static void updateAtomicBlast(float dt) {
+    bool testKeyDown = keyDown('T');
+    if (testKeyDown && !g_atomicTestKeyWasDown) triggerAtomicBlast();
+    g_atomicTestKeyWasDown = testKeyDown;
+    if (g_atomicTime > -100.0f) {
+        g_atomicTime += dt;
+        float a = atomicIntensity();
+        g_damagePulse = std::max(g_damagePulse, a * 0.72f);
+        g_hitPulse = std::max(g_hitPulse, a * 0.55f);
+        if (atomicEndFade() >= 0.995f) g_atomicEnded = true;
+    }
+}
+static void buildAtomicBlastFx() {
+    g_atomicTriangles.clear();
+    if (g_atomicTime < 0.0f || g_atomicTime > kAtomicDropSeconds + 44.0f) return;
+    float t = g_atomicTime - kAtomicDropSeconds;
+    Vec3 base = g_atomicOrigin;
+    float ground = renderedSurfaceHeight(base.x, base.z);
+    base.y = ground;
+    if (t < 0.0f) {
+        float drop = smoothstep(0.0f, kAtomicDropSeconds, g_atomicTime);
+        Vec3 bomb{base.x, ground + 1900.0f * (1.0f - drop) + 28.0f, base.z};
+        pushAtomicBillboard(bomb, 90.0f, 220.0f, {1.45f, 1.12f, 0.08f}, 1.0f);
+        pushFrameLine({bomb.x, bomb.y + 260.0f, bomb.z}, bomb, {1.45f, 0.92f, 0.02f}, 1.0f);
+        return;
+    }
+    float flash = smoothstep(4.6f, 0.0f, t);
+    float bloom = smoothstep(0.1f, 3.2f, t) * smoothstep(36.0f, 6.0f, t);
+    float rise = smoothstep(0.0f, 18.0f, t);
+    float shock = 620.0f + t * 420.0f;
+    if (t < 18.0f) {
+        pushAtomicRing({base.x, ground + 3.0f, base.z}, shock, {1.55f, 1.06f, 0.04f}, 1.0f);
+        pushAtomicRing({base.x, ground + 7.0f, base.z}, shock * 0.58f, {1.35f, 0.72f, 0.02f}, 0.9f, 96);
+    }
+    float fire = (620.0f + t * 120.0f) * smoothstep(9.0f, 0.2f, t);
+    if (fire > 2.0f) {
+        pushAtomicBillboard({base.x, ground + fire * 0.34f, base.z}, fire * 4.5f, fire * 1.35f, {1.65f, 1.02f, 0.02f}, 1.0f);
+        pushAtomicBillboard({base.x, ground + fire * 0.58f, base.z}, fire * 2.3f, fire * 1.45f, {1.35f, 1.24f, 0.22f}, 1.0f);
+    }
+    float stemH = (620.0f + rise * 1400.0f);
+    float stemW = (190.0f + rise * 420.0f);
+    for (int i = 0; i < 16; ++i) {
+        float fi = static_cast<float>(i);
+        float h = stemH * (0.06f + fi * 0.062f);
+        float a = fi * 1.7f + g_time * 0.12f;
+        Vec3 p{base.x + std::cos(a) * stemW * (0.08f + fi * 0.020f), ground + h, base.z + std::sin(a) * stemW * 0.14f};
+        float s = stemW * (0.50f + fi * 0.035f);
+        Vec3 c{0.95f + flash * 0.46f, 0.76f + flash * 0.34f, 0.26f + flash * 0.05f};
+        pushAtomicBillboard(p, s * 2.3f, s * 1.7f, c, 0.65f);
+    }
+    float capY = ground + 1250.0f + rise * 900.0f;
+    float capW = 1450.0f + rise * 2400.0f;
+    float capH = 440.0f + rise * 500.0f;
+    for (int ring = 0; ring < 4; ++ring) {
+        int count = 14 + ring * 9;
+        float rf = 0.10f + ring * 0.13f;
+        for (int i = 0; i < count; ++i) {
+            float a = static_cast<float>(i) / static_cast<float>(count) * 6.2831853f + ring * 0.37f + g_time * 0.018f;
+            float seed = rand01(5000 + ring * 41 + i, 777);
+            Vec3 p{base.x + std::cos(a) * capW * rf * (0.80f + seed * 0.38f),
+                   capY + std::sin(a * 2.0f + seed) * capH * 0.12f,
+                   base.z + std::sin(a) * capW * rf * 0.42f};
+            Vec3 c = ring < 2 ? Vec3{1.05f, 0.84f, 0.28f} : Vec3{0.70f, 0.58f, 0.30f};
+            c = {c.x + flash * 0.42f + bloom * 0.25f, c.y + flash * 0.34f + bloom * 0.18f, c.z + flash * 0.04f};
+            pushAtomicBillboard(p, capH * (0.74f + seed * 0.34f), capH * (0.50f + seed * 0.24f), c, 0.55f);
+        }
+    }
+    for (int i = 0; i < 90; ++i) {
+        float seed = rand01(i + 6100, 33);
+        float a = seed * 6.2831853f;
+        float r = (420.0f + seed * 2200.0f) * bloom;
+        Vec3 p{base.x + std::cos(a) * r, ground + 80.0f + rand01(i, 44) * 1200.0f * bloom, base.z + std::sin(a) * r * 0.55f};
+        pushAtomicBillboard(p, 45.0f + seed * 130.0f, 30.0f + seed * 90.0f, {1.22f, 0.82f, 0.08f}, 0.7f);
+    }
+}
 static void buildWorld() {
     g_triangles.clear();
     g_lines.clear();
@@ -1314,6 +1460,8 @@ uniform float uWeaponPulse;
 uniform float uHitPulse;
 uniform float uDamagePulse;
 uniform float uHealth;
+uniform float uAtomic;
+uniform float uAtomicFade;
 uniform vec3 uIncomingDir;
 out vec4 FragColor;
 float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
@@ -1335,10 +1483,13 @@ void main() {
     float n2 = noise(vec2(uv.x * 52.0 - uTime * 1.2, uv.y * 13.0 + uTime * 0.28));
     float n3 = noise(vec2(uv.x * 8.0 - uTime * 0.22, uv.y * 2.4 + uTime * 0.08));
     float thirstHeat = smoothstep(0.12, 1.0, uThirst);
+    float atomic = clamp(uAtomic, 0.0, 1.0);
+    float endFade = clamp(uAtomicFade, 0.0, 1.0);
     float shimmer = (n1 - 0.5) * 0.024 + (n2 - 0.5) * 0.008 + (n3 - 0.5) * 0.018;
-    shimmer *= heatLow * (1.70 + uGlitch * 3.6 + uTowerAlign * 1.45 + thirstHeat * 4.5);
+    shimmer *= heatLow * (1.70 + uGlitch * 3.6 + uTowerAlign * 1.45 + thirstHeat * 4.5 + atomic * 12.0);
     uv.x += shimmer;
-    uv.y += sin(uv.x * 80.0 + uTime * 2.1) * heatLow * 0.0023;
+    uv.y += sin(uv.x * 80.0 + uTime * 2.1) * heatLow * (0.0023 + atomic * 0.018);
+    uv += center * atomic * (0.030 + 0.026 * sin(uTime * 29.0));
 
     vec3 color = scene(uv);
     vec3 mirage = scene(uv + vec2(shimmer * 2.2, -0.010 * heatLow));
@@ -1352,6 +1503,9 @@ void main() {
     float sun = pow(max(0.0, 1.0 - length((uv - vec2(0.78, 0.82)) * vec2(1.0, 1.25))), 9.0);
     color += vec3(1.0, 0.76, 0.34) * sun * 1.35;
     color += vec3(0.95, 0.74, 0.45) * horizon * (0.15 + uGlitch * 0.36 + thirstHeat * 0.30);
+    float blastCore = pow(max(0.0, 1.0 - length(center * vec2(1.0, 0.78))), 2.0);
+    color += vec3(3.0, 2.05, 0.10) * atomic * (0.48 + horizon * 1.45 + blastCore * 0.95);
+    color = mix(color, vec3(1.0, 0.92, 0.22), atomic * 0.48);
 
     float dust = noise(uv * vec2(5.0, 2.8) + vec2(uTime * 0.018, -uTime * 0.012));
     color = mix(color, vec3(0.88, 0.71, 0.48), smoothstep(0.25, 0.92, dust) * 0.18);
@@ -1373,7 +1527,7 @@ void main() {
     color = mix(color, color * vec3(1.16, 0.90, 0.70) + vec3(0.10, 0.025, 0.0), fever * 0.34);
 
     float grain = hash(uv * uResolution.xy + floor(uTime * 24.0)) - 0.5;
-    color += grain * 0.010;
+    color += grain * (0.010 + atomic * 0.050);
     color = color / (color + vec3(0.88));
     color = pow(color, vec3(0.86, 0.90, 1.0));
     color *= vec3(1.12, 1.02, 0.90);
@@ -1415,6 +1569,7 @@ void main() {
     float cross = (1.0 - smoothstep(0.45, 1.15, abs(pixel.x - uResolution.x * 0.5))) * smoothstep(5.0, 8.0, abs(pixel.y - uResolution.y * 0.5));
     cross += (1.0 - smoothstep(0.45, 1.15, abs(pixel.y - uResolution.y * 0.5))) * smoothstep(5.0, 8.0, abs(pixel.x - uResolution.x * 0.5));
     color = mix(color, vec3(0.82, 0.78, 0.66), clamp(cross, 0.0, 1.0) * 0.22);
+    color = mix(color, vec3(0.0), endFade);
     FragColor = vec4(color, 1.0);
 }
 )GLSL";
@@ -1458,6 +1613,8 @@ static void cacheUniformLocations() {
     g_postUniforms.hitPulse = glGetUniformLocation(g_postProgram, "uHitPulse");
     g_postUniforms.damagePulse = glGetUniformLocation(g_postProgram, "uDamagePulse");
     g_postUniforms.health = glGetUniformLocation(g_postProgram, "uHealth");
+    g_postUniforms.atomic = glGetUniformLocation(g_postProgram, "uAtomic");
+    g_postUniforms.atomicFade = glGetUniformLocation(g_postProgram, "uAtomicFade");
     g_postUniforms.incomingDir = glGetUniformLocation(g_postProgram, "uIncomingDir");
     g_postUniforms.resolution = glGetUniformLocation(g_postProgram, "uResolution");
 }
@@ -1489,6 +1646,7 @@ static bool initRenderer() {
     g_postProgram = createProgram(kPostVs, kPostFs);
     cacheUniformLocations();
     setupVertexStream(g_sceneVao, g_sceneVbo);
+    setupVertexStream(g_atomicVao, g_atomicVbo);
     setupVertexStream(g_lineVao, g_lineVbo);
     setupVertexStream(g_fxLineVao, g_fxLineVbo);
     float quad[] = {
@@ -1516,14 +1674,21 @@ static void render() {
     resizeFramebuffer();
     if (shouldRebuildWorld()) buildWorld();
     float g = glitchAmount();
+    float atomic = atomicIntensity();
+    float endFade = atomicEndFade();
+    float finalShake = atomicFinalConvulsion();
     float cp = std::cos(g_pitch);
     Vec3 dir{std::sin(g_yaw) * cp, std::sin(g_pitch), std::cos(g_yaw) * cp};
     Vec3 towerFocus = currentSightingPosition();
     float towerDot = dot(norm(dir), norm(sub(towerFocus, g_player)));
     float towerAlign = smoothstep(0.985f, 0.999f, towerDot);
     towerAlign *= 0.82f + 0.18f * (0.5f + 0.5f * std::sin(g_time * 3.0f));
-    Mat4 view = lookAt(g_player, add(g_player, dir), {0, 1, 0});
-    Mat4 proj = perspective(66.0f + g * 2.5f, static_cast<float>(g_width) / std::max(1, g_height), 0.08f, 3600.0f);
+    Vec3 right = norm(cross(norm({dir.x, 0.0f, dir.z}), {0, 1, 0}));
+    float shake = atomic * (0.55f + 0.75f * std::sin(g_time * 23.0f) * std::sin(g_time * 47.0f));
+    shake += finalShake * (1.9f + 1.5f * std::sin(g_time * 37.0f) * std::sin(g_time * 83.0f));
+    Vec3 renderEye = add(g_player, add(mul(right, std::sin(g_time * 91.0f) * shake), {0.0f, std::cos(g_time * 77.0f) * shake * 0.55f, 0.0f}));
+    Mat4 view = lookAt(renderEye, add(renderEye, dir), {0, 1, 0});
+    Mat4 proj = perspective(66.0f + g * 2.5f + atomic * 18.0f + finalShake * 12.0f, static_cast<float>(g_width) / std::max(1, g_height), 0.08f, 6200.0f);
     Mat4 mvp = multiply(proj, view);
 
     glBindFramebuffer(GL_FRAMEBUFFER, g_fbo);
@@ -1542,12 +1707,21 @@ static void render() {
     glUniform1f(g_sceneUniforms.towerZ, towerFocus.z);
 
     glDisable(GL_CULL_FACE);
+    g_frameLines.clear();
+    buildAtomicBlastFx();
+
     glBindVertexArray(g_sceneVao);
     glBindBuffer(GL_ARRAY_BUFFER, g_sceneVbo);
     if (g_sceneBuffersDirty) {
         glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(g_triangles.size() * sizeof(Vertex)), g_triangles.data(), GL_DYNAMIC_DRAW);
     }
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(g_triangles.size()));
+    if (!g_atomicTriangles.empty()) {
+        glBindVertexArray(g_atomicVao);
+        glBindBuffer(GL_ARRAY_BUFFER, g_atomicVbo);
+        glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(g_atomicTriangles.size() * sizeof(Vertex)), g_atomicTriangles.data(), GL_DYNAMIC_DRAW);
+        glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(g_atomicTriangles.size()));
+    }
 
     glLineWidth(1.35f + g * 1.2f);
     glBindVertexArray(g_lineVao);
@@ -1557,18 +1731,18 @@ static void render() {
         g_sceneBuffersDirty = false;
     }
     glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(g_lines.size()));
-    if (g_tracerPulse > 0.01f || g_enemyTracerPulse > 0.01f) {
-        g_frameLines.clear();
-        if (g_tracerPulse > 0.01f) {
-            Vec3 tracerColor{1.0f, 0.78f * g_tracerPulse, 0.24f * g_tracerPulse};
-            g_frameLines.push_back({g_tracerStart, {0, 1, 0}, tracerColor, 1.0f});
-            g_frameLines.push_back({g_tracerEnd, {0, 1, 0}, tracerColor, 1.0f});
-        }
-        if (g_enemyTracerPulse > 0.01f) {
-            Vec3 enemyColor{1.0f, 0.04f * g_enemyTracerPulse, 0.0f};
-            g_frameLines.push_back({g_enemyTracerStart, {0, 1, 0}, enemyColor, 1.0f});
-            g_frameLines.push_back({g_enemyTracerEnd, {0, 1, 0}, enemyColor, 1.0f});
-        }
+
+    if (g_tracerPulse > 0.01f) {
+        Vec3 tracerColor{1.0f, 0.78f * g_tracerPulse, 0.24f * g_tracerPulse};
+        g_frameLines.push_back({g_tracerStart, {0, 1, 0}, tracerColor, 1.0f});
+        g_frameLines.push_back({g_tracerEnd, {0, 1, 0}, tracerColor, 1.0f});
+    }
+    if (g_enemyTracerPulse > 0.01f) {
+        Vec3 enemyColor{1.0f, 0.04f * g_enemyTracerPulse, 0.0f};
+        g_frameLines.push_back({g_enemyTracerStart, {0, 1, 0}, enemyColor, 1.0f});
+        g_frameLines.push_back({g_enemyTracerEnd, {0, 1, 0}, enemyColor, 1.0f});
+    }
+    if (!g_frameLines.empty()) {
         glBindVertexArray(g_fxLineVao);
         glBindBuffer(GL_ARRAY_BUFFER, g_fxLineVbo);
         glBufferData(GL_ARRAY_BUFFER, static_cast<GLsizeiptr>(g_frameLines.size() * sizeof(Vertex)), g_frameLines.data(), GL_DYNAMIC_DRAW);
@@ -1597,6 +1771,8 @@ static void render() {
     glUniform1f(g_postUniforms.hitPulse, g_hitPulse);
     glUniform1f(g_postUniforms.damagePulse, g_damagePulse);
     glUniform1f(g_postUniforms.health, g_playerHealth);
+    glUniform1f(g_postUniforms.atomic, clampf(atomic + finalShake * 0.85f, 0.0f, 1.0f));
+    glUniform1f(g_postUniforms.atomicFade, endFade);
     glUniform3f(g_postUniforms.incomingDir, g_incomingDirX, g_incomingDirY, 0.0f);
     glUniform3f(g_postUniforms.resolution, static_cast<float>(g_width), static_cast<float>(g_height), 0.0f);
     glBindVertexArray(g_quadVao);
@@ -1757,6 +1933,11 @@ static void updateSnipers(float dt) {
 }
 static void update(float dt) {
     updateMouse();
+    updateAtomicBlast(dt);
+    if (g_atomicEnded) {
+        updateTelemetry(dt);
+        return;
+    }
     if (g_fireRequested) {
         fireWeapon();
         g_fireRequested = false;

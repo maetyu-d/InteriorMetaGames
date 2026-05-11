@@ -123,6 +123,18 @@ struct SignalTelemetry {
 };
 #pragma pack(pop)
 
+#pragma pack(push, 1)
+struct AtomicBombControl {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t byteSize;
+    uint32_t triggerSequence;
+    float bombX;
+    float bombZ;
+    float yieldScale;
+};
+#pragma pack(pop)
+
 static HWND g_hwnd = nullptr;
 static HDC g_hdc = nullptr;
 static HGLRC g_glrc = nullptr;
@@ -151,6 +163,14 @@ static float g_wrongWaySignal = 0.0f;
 static float g_wrongWaySustain = 0.0f;
 static float g_signalReached = 0.0f;
 static float g_falseStartFlash = 0.0f;
+static float g_atomicTime = -1000.0f;
+static float g_atomicFileTimer = 0.0f;
+static float g_atomicYield = 1.0f;
+static Vec3 g_atomicOrigin{360.0f, 0.0f, -1450.0f};
+static uint32_t g_lastAtomicTriggerSequence = 0;
+static uint32_t g_lastAtomicFileSequence = 0;
+static bool g_atomicTestKeyWasDown = false;
+static bool g_atomicEnded = false;
 static int g_signalStage = 0;
 
 static GLuint g_sceneProgram = 0;
@@ -170,6 +190,9 @@ static std::vector<Aabb> g_buildingColliders;
 static HANDLE g_telemetryMapping = nullptr;
 static SignalTelemetry* g_telemetry = nullptr;
 static char g_telemetryPath[MAX_PATH] = {};
+static HANDLE g_atomicControlMapping = nullptr;
+static AtomicBombControl* g_atomicControl = nullptr;
+static char g_atomicTriggerPath[MAX_PATH] = {};
 
 static constexpr float kTowerZ = -2600.0f;
 static constexpr float kStartZ = 420.0f;
@@ -180,7 +203,10 @@ static constexpr float kPlayerEyeHeight = 5.8f;
 static constexpr float kPlayerFootRadius = 1.35f;
 static constexpr float kPlayerGroundClearance = 0.38f;
 static constexpr float kTerrainMeshStep = 6.5f;
+static constexpr float kAtomicDropSeconds = 3.1f;
 static constexpr uint32_t kTelemetryMagic = 0x4443484Eu; // DCHN
+static constexpr float kTelemetryFileInterval = 2.0f;
+static constexpr uint32_t kAtomicControlMagic = 0x44434142u; // DCAB
 
 static float clampf(float v, float lo, float hi) { return std::max(lo, std::min(v, hi)); }
 static float lerp(float a, float b, float t) { return a + (b - a) * t; }
@@ -336,6 +362,85 @@ static void initTelemetry() {
         if (backslash && (!slash || backslash > slash)) slash = backslash;
         if (slash) *(slash + 1) = '\0';
         std::snprintf(g_telemetryPath, sizeof(g_telemetryPath), "%sDeadChannelSignalTelemetry.json", exePath);
+        std::snprintf(g_atomicTriggerPath, sizeof(g_atomicTriggerPath), "%sDeadChannelAtomicTrigger.txt", exePath);
+    }
+    g_atomicControlMapping = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                                sizeof(AtomicBombControl), "Local\\DeadChannelAtomicControl");
+    if (g_atomicControlMapping) {
+        g_atomicControl = static_cast<AtomicBombControl*>(
+            MapViewOfFile(g_atomicControlMapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(AtomicBombControl)));
+    }
+    if (g_atomicControl) {
+        if (g_atomicControl->magic != kAtomicControlMagic || g_atomicControl->byteSize != sizeof(AtomicBombControl)) {
+            std::memset(g_atomicControl, 0, sizeof(AtomicBombControl));
+            g_atomicControl->magic = kAtomicControlMagic;
+            g_atomicControl->version = 1;
+            g_atomicControl->byteSize = sizeof(AtomicBombControl);
+            g_atomicControl->yieldScale = 1.0f;
+        }
+        g_lastAtomicTriggerSequence = g_atomicControl->triggerSequence;
+    }
+    if (g_atomicTriggerPath[0]) {
+        FILE* f = nullptr;
+        if (fopen_s(&f, g_atomicTriggerPath, "rb") == 0 && f) {
+            unsigned int seq = 0;
+            if (std::fscanf(f, "%u", &seq) == 1) {
+                g_lastAtomicFileSequence = seq;
+            }
+            std::fclose(f);
+        }
+    }
+}
+
+static void triggerAtomicBomb(float x, float z, float yieldScale) {
+    float clampedYield = clampf(yieldScale, 0.45f, 2.6f) * 2.45f;
+    if (std::fabs(x) < 0.01f && std::fabs(z) < 0.01f) {
+        float side = std::sin(g_time * 0.61f) > 0.0f ? 1.0f : -1.0f;
+        x = side * (185.0f + 55.0f * std::fabs(std::sin(g_time * 0.37f)));
+        z = currentTowerZ() + 240.0f + std::sin(g_time * 0.43f) * 70.0f;
+        z = std::min(z, g_player.z - 850.0f);
+        z = clampf(z, finalTowerZ() + 260.0f, kStartZ - 850.0f);
+    }
+    g_atomicOrigin = {x, terrainHeight(x, z), z};
+    g_atomicYield = clampedYield;
+    g_atomicTime = 0.0f;
+    g_atomicEnded = false;
+    g_wrongWaySignal = std::max(g_wrongWaySignal, 0.45f);
+}
+static float atomicEndFade() {
+    if (g_atomicTime < 0.0f) return 0.0f;
+    float t = g_atomicTime - kAtomicDropSeconds;
+    return t <= 15.0f ? 0.0f : smoothstep(15.0f, 22.0f, t);
+}
+
+static void pollAtomicTriggers(float dt) {
+    if (g_atomicTime > -100.0f) g_atomicTime += dt;
+    bool testKeyDown = (GetAsyncKeyState('T') & 0x8000) != 0;
+    if (testKeyDown && !g_atomicTestKeyWasDown) {
+        triggerAtomicBomb(0.0f, 0.0f, 1.0f);
+    }
+    g_atomicTestKeyWasDown = testKeyDown;
+    if (g_atomicControl && g_atomicControl->magic == kAtomicControlMagic) {
+        uint32_t seq = g_atomicControl->triggerSequence;
+        if (seq != g_lastAtomicTriggerSequence) {
+            g_lastAtomicTriggerSequence = seq;
+            triggerAtomicBomb(g_atomicControl->bombX, g_atomicControl->bombZ, g_atomicControl->yieldScale <= 0.0f ? 1.0f : g_atomicControl->yieldScale);
+        }
+    }
+    g_atomicFileTimer += dt;
+    if (g_atomicFileTimer >= 0.20f && g_atomicTriggerPath[0]) {
+        g_atomicFileTimer = 0.0f;
+        FILE* f = nullptr;
+        if (fopen_s(&f, g_atomicTriggerPath, "rb") == 0 && f) {
+            unsigned int seq = 0;
+            float x = 0.0f, z = 0.0f, yield = 1.0f;
+            int read = std::fscanf(f, "%u %f %f %f", &seq, &x, &z, &yield);
+            std::fclose(f);
+            if (read >= 1 && seq != g_lastAtomicFileSequence) {
+                g_lastAtomicFileSequence = seq;
+                triggerAtomicBomb(read >= 3 ? x : 0.0f, read >= 3 ? z : 0.0f, read >= 4 ? yield : 1.0f);
+            }
+        }
     }
 }
 
@@ -376,7 +481,7 @@ static void writeTelemetryFile(const SignalTelemetry& t) {
                  t.playerMoveDirZ, t.playerYaw, t.playerPitch, t.signalX, t.signalY, t.signalZ,
                  t.visibleTowerZ, t.falseStartStage, t.finalStage, t.signalReached, t.falseStartFlash);
     std::fclose(f);
-    MoveFileExA(tmpPath, g_telemetryPath, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    MoveFileExA(tmpPath, g_telemetryPath, MOVEFILE_REPLACE_EXISTING);
 }
 
 static void updateTelemetry(float dt) {
@@ -442,7 +547,7 @@ static void updateTelemetry(float dt) {
     g_hasTelemetryPlayer = true;
 
     g_telemetryFileTimer += dt;
-    if (g_telemetryFileTimer >= 0.25f) {
+    if (g_telemetryFileTimer >= kTelemetryFileInterval) {
         g_telemetryFileTimer = 0.0f;
         writeTelemetryFile(t);
     }
@@ -458,6 +563,14 @@ static void shutdownTelemetry() {
     if (g_telemetryMapping) {
         CloseHandle(g_telemetryMapping);
         g_telemetryMapping = nullptr;
+    }
+    if (g_atomicControl) {
+        UnmapViewOfFile(g_atomicControl);
+        g_atomicControl = nullptr;
+    }
+    if (g_atomicControlMapping) {
+        CloseHandle(g_atomicControlMapping);
+        g_atomicControlMapping = nullptr;
     }
 }
 
@@ -525,6 +638,56 @@ static void pushCube(Vec3 center, Vec3 scale, Vec3 color, float shine, float yaw
     for (auto& q : f) {
         pushTri(p[q[0]], p[q[1]], p[q[2]], color, shine);
         pushTri(p[q[0]], p[q[2]], p[q[3]], color, shine);
+    }
+}
+static void pushBillboard(Vec3 center, float width, float height, Vec3 color, float shine) {
+    Vec3 toPlayer = norm(sub(g_player, center));
+    Vec3 right = norm(cross({0.0f, 1.0f, 0.0f}, toPlayer));
+    Vec3 up{0.0f, 1.0f, 0.0f};
+    Vec3 r = mul(right, width * 0.5f);
+    Vec3 u = mul(up, height * 0.5f);
+    Vec3 a = sub(sub(center, r), u);
+    Vec3 b = add(sub(center, u), r);
+    Vec3 c = add(add(center, r), u);
+    Vec3 d = add(sub(center, r), u);
+    pushTri(a, b, c, color, shine);
+    pushTri(a, c, d, color, shine);
+}
+static void pushHorizontalRing(Vec3 center, float radius, Vec3 color, float shine, int steps = 96) {
+    Vec3 prev{center.x + radius, center.y, center.z};
+    for (int i = 1; i <= steps; ++i) {
+        float a = static_cast<float>(i) / static_cast<float>(steps) * 6.2831853f;
+        Vec3 cur{center.x + std::cos(a) * radius, center.y, center.z + std::sin(a) * radius};
+        pushLine(prev, cur, color, shine);
+        prev = cur;
+    }
+}
+static void pushSmokePuff(Vec3 center, float radius, Vec3 color, float shine, int seed) {
+    float a = rand01(seed, 11) * 6.2831853f;
+    float wob = 0.82f + rand01(seed, 12) * 0.42f;
+    float ash = rand01(seed, 13);
+    Vec3 warm{0.18f + ash * 0.08f, 0.12f + ash * 0.045f, 0.045f};
+    Vec3 cool{-0.05f * ash, -0.045f * ash, -0.035f * ash};
+    Vec3 base{clampf(color.x + warm.x + cool.x, 0.02f, 1.35f),
+              clampf(color.y + warm.y + cool.y, 0.02f, 1.20f),
+              clampf(color.z + warm.z + cool.z, 0.02f, 1.05f)};
+    pushBillboard(center, radius * 2.1f * wob, radius * 1.55f, base, shine);
+    Vec3 c2{base.x * 0.62f, base.y * 0.64f, base.z * 0.68f};
+    Vec3 c3{base.x * 1.16f, base.y * 1.10f, base.z * 0.96f};
+    pushBillboard({center.x + std::cos(a) * radius * 0.28f, center.y + radius * 0.12f, center.z + std::sin(a) * radius * 0.18f},
+                  radius * 1.35f, radius * 1.22f, c2, shine * 0.85f);
+    pushBillboard({center.x - std::sin(a) * radius * 0.20f, center.y - radius * 0.10f, center.z + std::cos(a) * radius * 0.14f},
+                  radius * 1.12f, radius * 0.95f, c3, shine * 0.78f);
+    float crease = 0.30f + ash * 0.22f;
+    Vec3 lineColor{base.x * crease, base.y * crease * 0.95f, base.z * crease * 0.88f};
+    Vec3 hiColor{base.x * 1.25f, base.y * 1.14f, base.z * 0.92f};
+    float lineY = center.y + radius * (0.08f + rand01(seed, 14) * 0.28f);
+    float lineW = radius * (0.62f + rand01(seed, 15) * 0.34f);
+    pushLine({center.x - std::cos(a) * lineW, lineY, center.z - std::sin(a) * lineW * 0.35f},
+             {center.x + std::cos(a) * lineW, lineY + radius * 0.10f, center.z + std::sin(a) * lineW * 0.35f}, lineColor, shine * 0.55f);
+    if (rand01(seed, 16) > 0.52f) {
+        pushLine({center.x - std::sin(a) * lineW * 0.52f, center.y + radius * 0.34f, center.z + std::cos(a) * lineW * 0.22f},
+                 {center.x + std::sin(a) * lineW * 0.40f, center.y + radius * 0.47f, center.z - std::cos(a) * lineW * 0.18f}, hiColor, shine * 0.46f);
     }
 }
 static void pushBuilding(Vec3 baseCenter, Vec3 halfSize, Vec3 color, float shine) {
@@ -832,6 +995,96 @@ static void buildAtmosphereDetail() {
         }
     }
 }
+static void buildAtomicBomb() {
+    if (g_atomicTime < 0.0f || g_atomicTime > kAtomicDropSeconds + 44.0f) return;
+    float t = g_atomicTime - kAtomicDropSeconds;
+    float y = g_atomicYield;
+    Vec3 base = g_atomicOrigin;
+    float ground = renderedSurfaceHeight(base.x, base.z);
+    base.y = ground;
+    if (t < 0.0f) {
+        float drop = smoothstep(0.0f, kAtomicDropSeconds, g_atomicTime);
+        float dropY = ground + (980.0f + 220.0f * y) * (1.0f - drop) + 18.0f;
+        float flare = 0.55f + 0.45f * std::sin(g_time * 18.0f);
+        Vec3 bombPos{base.x, dropY, base.z};
+        pushBillboard(bombPos, 22.0f * y, 52.0f * y, {0.78f + flare * 0.35f, 0.58f + flare * 0.18f, 0.25f}, 1.0f);
+        pushLine({bombPos.x, bombPos.y + 70.0f * y, bombPos.z}, bombPos, {0.52f, 0.44f, 0.34f}, 0.82f);
+        pushLine({bombPos.x - 10.0f * y, bombPos.y + 48.0f * y, bombPos.z + 4.0f}, {bombPos.x + 8.0f * y, bombPos.y - 14.0f * y, bombPos.z}, {0.95f, 0.60f, 0.20f}, 0.92f);
+        return;
+    }
+    float flash = smoothstep(3.2f, 0.0f, t);
+    float bloom = smoothstep(0.0f, 2.6f, t) * smoothstep(24.0f, 5.0f, t);
+    float rise = smoothstep(0.0f, 18.0f, t);
+    float boil = 0.5f + 0.5f * std::sin(g_time * 3.8f);
+    float shock = (320.0f + t * 315.0f) * y;
+    Vec3 shockColor{0.95f * flash + 0.20f * bloom, 0.72f * flash + 0.20f * bloom, 0.34f * flash + 0.12f * bloom};
+    if (t < 18.0f) {
+        pushHorizontalRing({base.x, ground + 1.2f, base.z}, shock, shockColor, 1.0f);
+        pushHorizontalRing({base.x, ground + 2.2f, base.z}, shock * 0.72f, {shockColor.x * 0.55f, shockColor.y * 0.48f, shockColor.z * 0.38f}, 0.9f, 80);
+        pushHorizontalRing({base.x, ground + 4.0f, base.z}, shock * 0.46f, {shockColor.x * 0.82f, shockColor.y * 0.58f, shockColor.z * 0.28f}, 1.0f, 112);
+    }
+    float fireSize = (360.0f + t * 105.0f) * smoothstep(7.2f, 0.18f, t) * y;
+    if (fireSize > 2.0f) {
+        pushBillboard({base.x, ground + fireSize * 0.44f, base.z}, fireSize * 2.35f, fireSize * 1.35f, {1.35f, 0.66f, 0.10f}, 1.0f);
+        pushBillboard({base.x, ground + fireSize * 0.58f, base.z}, fireSize * 1.35f, fireSize * 0.98f, {1.0f, 0.98f, 0.64f}, 1.0f);
+        pushBillboard({base.x, ground + fireSize * 0.22f, base.z}, fireSize * 4.20f, fireSize * 0.78f, {1.0f, 0.34f, 0.055f}, 1.0f);
+    }
+    float stemH = (240.0f + rise * 620.0f) * y;
+    float stemW = (120.0f + rise * 330.0f + boil * 42.0f) * y;
+    Vec3 smokeA{0.47f + flash * 0.56f + bloom * 0.18f, 0.41f + flash * 0.40f + bloom * 0.13f, 0.31f + flash * 0.17f + bloom * 0.07f};
+    Vec3 smokeB{0.28f + bloom * 0.34f, 0.27f + bloom * 0.26f, 0.24f + bloom * 0.15f};
+    for (int i = 0; i < 13; ++i) {
+        float fi = static_cast<float>(i);
+        float h = stemH * (0.08f + fi * 0.067f);
+        float twist = fi * 1.85f + g_time * 0.16f;
+        float radial = stemW * (0.08f + fi * 0.022f);
+        float wob = std::sin(g_time * 0.9f + fi * 1.7f) * stemW * 0.08f;
+        float r = stemW * (0.34f + fi * 0.030f);
+        Vec3 c = i < 5 ? smokeA : smokeB;
+        c = {c.x + (1.0f - fi / 13.0f) * 0.18f, c.y + (1.0f - fi / 13.0f) * 0.08f, c.z};
+        pushSmokePuff({base.x + std::cos(twist) * radial + wob, ground + h, base.z + std::sin(twist) * radial * 0.55f}, r, c, 0.70f, 1200 + i);
+        if (i % 2 == 0) {
+            pushSmokePuff({base.x - std::sin(twist) * radial * 0.7f, ground + h + r * 0.18f, base.z + std::cos(twist) * radial * 0.38f}, r * 0.72f, {c.x * 0.82f, c.y * 0.82f, c.z * 0.84f}, 0.58f, 1250 + i);
+        }
+    }
+    float capY = ground + (500.0f + rise * 430.0f) * y;
+    float capW = (820.0f + rise * 1500.0f + boil * 92.0f) * y;
+    float capH = (210.0f + rise * 310.0f) * y;
+    for (int ring = 0; ring < 3; ++ring) {
+        int count = ring == 0 ? 11 : (ring == 1 ? 15 : 19);
+        float ringFrac = ring == 0 ? 0.12f : (ring == 1 ? 0.28f : 0.43f);
+        for (int i = 0; i < count; ++i) {
+            float fi = static_cast<float>(i);
+            float a = fi / static_cast<float>(count) * 6.2831853f + ring * 0.41f + g_time * 0.025f;
+            float seed = rand01(1400 + ring * 31 + i, 71);
+            float wob = 0.78f + 0.34f * std::sin(g_time * 0.42f + fi * 1.7f + ring);
+            Vec3 p{base.x + std::cos(a) * capW * ringFrac * wob,
+                   capY + (ring == 0 ? capH * 0.16f : 0.0f) + std::sin(a * 2.0f + seed) * capH * 0.14f,
+                   base.z + std::sin(a) * capW * ringFrac * 0.47f * wob};
+            Vec3 c = ring == 2 ? Vec3{0.36f, 0.35f, 0.32f} : Vec3{0.50f, 0.44f, 0.34f};
+            float rim = 0.20f + 0.28f * std::max(0.0f, std::cos(a - 0.8f));
+            float under = std::max(0.0f, 1.0f - ringFrac * 1.7f) * smoothstep(12.0f, 0.0f, t);
+            float grime = rand01(1600 + ring * 17 + i, 91);
+            c = {c.x + flash * 0.58f + bloom * rim + under * 0.28f,
+                 c.y + flash * 0.40f + bloom * rim * 0.74f + under * 0.12f,
+                 c.z + flash * 0.18f + bloom * rim * 0.40f};
+            c = {c.x * (0.86f + grime * 0.24f), c.y * (0.84f + grime * 0.20f), c.z * (0.80f + grime * 0.16f)};
+            float radius = capH * (0.44f + seed * 0.22f) * (ring == 2 ? 1.02f : 0.86f);
+            pushSmokePuff(p, radius, c, 0.62f, 1500 + ring * 80 + i);
+        }
+    }
+    pushHorizontalRing({base.x, capY - capH * 0.05f, base.z}, capW * 0.52f, {0.76f, 0.48f, 0.20f}, 0.9f, 128);
+    for (int i = 0; i < 34; ++i) {
+        float seed = rand01(i + 900, 17);
+        float a = seed * 6.2831853f + g_time * 0.03f;
+        float r = (capW * 0.20f) + rand01(i, 33) * capW * 0.55f;
+        float yy = capY + (rand01(i, 44) - 0.5f) * capH * 0.9f;
+        Vec3 p{base.x + std::cos(a) * r, yy, base.z + std::sin(a) * r * 0.55f};
+        float s = (16.0f + rand01(i, 55) * 42.0f) * y;
+        Vec3 dirty{0.22f + seed * 0.16f, 0.21f + seed * 0.13f, 0.19f + seed * 0.08f};
+        pushSmokePuff(p, s * 0.92f, dirty, 0.42f, 1700 + i);
+    }
+}
 static void buildTower() {
     float towerZ = currentTowerZ();
     buildPylon(0.0f, towerZ, 230.0f, {0.55f, 0.88f, 1.0f});
@@ -862,6 +1115,7 @@ static void buildWorld() {
     buildDistantSilhouettes();
     buildBrutalistBlocks();
     buildAtmosphereDetail();
+    buildAtomicBomb();
     buildTower();
 }
 
@@ -1179,6 +1433,8 @@ uniform float uTowerAlign;
 uniform float uWrongWay;
 uniform float uSignalReached;
 uniform float uFalseStart;
+uniform float uAtomicFlash;
+uniform float uAtomicFade;
 out vec4 FragColor;
 float hash(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
 vec3 sampleScene(vec2 uv) { return texture(uScene, clamp(uv, vec2(0.001), vec2(0.999))).rgb; }
@@ -1199,6 +1455,8 @@ void main() {
     float scan = sin((uv.y * uResolution.y + uTime * 12.0) * 3.14159);
     float wrongSurge = pow(uWrongWay, 0.75);
     float signalHeat = clamp(uGlitch + uTowerAlign * 0.55 + wrongSurge * 2.6, 0.0, 3.2);
+    float atomic = clamp(uAtomicFlash, 0.0, 1.0);
+    float endFade = clamp(uAtomicFade, 0.0, 1.0);
     float roll = fract(uTime * (0.035 + signalHeat * 0.055));
     float rollBand = smoothstep(0.03, 0.0, abs(fract(uv.y - roll) - 0.5));
     float band = floor(uv.y * mix(80.0, 22.0, clamp(signalHeat, 0.0, 1.0)));
@@ -1207,6 +1465,9 @@ void main() {
     vec2 center = uv - 0.5;
     float lineLock = pow(max(0.0, 1.0 - length(center * vec2(1.0, 1.25)) * 2.0), 3.0) * uTowerAlign;
     uv += center * dot(center, center) * (0.08 + lineLock * 0.035);
+    uv += center * atomic * (0.040 + 0.034 * sin(uTime * 37.0));
+    uv.x += atomic * sin(uTime * 83.0 + uv.y * 45.0) * 0.018;
+    uv.y += atomic * sin(uTime * 71.0 + uv.x * 38.0) * 0.010;
     uv.x += sin(uv.y * 80.0 + uTime * 21.0) * lineLock * 0.006;
     float block = mix(220.0, 36.0, clamp(signalHeat, 0.0, 1.0));
     vec2 buv = floor(uv * block) / block;
@@ -1225,6 +1486,9 @@ void main() {
     sky += vec3(0.35, 0.74, 0.9) * star * smoothstep(0.0, 0.55, 1.0 - uv.y) * (0.18 + uGlitch * 0.22);
     float empty = 1.0 - smoothstep(0.012, 0.08, dot(color, vec3(0.299, 0.587, 0.114)));
     color = mix(color, sky, empty * 0.9);
+    float blastVignette = smoothstep(0.82, 0.05, length(center * vec2(1.0, 0.78)));
+    color += vec3(1.55, 1.05, 0.52) * atomic * (0.42 + blastVignette * 0.95);
+    color = mix(color, vec3(1.0, 0.86, 0.56), atomic * 0.34);
     vec3 bloom = vec3(0.0);
     vec3 halo = vec3(0.0);
     vec2 px = 1.0 / uResolution.xy;
@@ -1266,7 +1530,7 @@ void main() {
     color += lockColor * lineLock * (0.18 + uTowerAlign * 0.45);
     color += vec3(1.0, 0.82, 0.18) * pow(max(0.0, 1.0 - abs(center.y) * 18.0), 2.0) * uTowerAlign * 0.13;
     float noise = hash(uv * uResolution.xy + floor(uTime * 60.0));
-    color += (noise - 0.5) * (0.05 + signalHeat * 0.2);
+    color += (noise - 0.5) * (0.05 + signalHeat * 0.2 + atomic * 0.06);
     float analogMottle = hash(floor(uv * uResolution.xy / vec2(5.0, 3.0)) + floor(uTime * 24.0));
     color += (analogMottle - 0.5) * vec3(0.020, 0.035, 0.040) * (0.35 + signalHeat);
     float organicBloom = softNoise(uv * vec2(9.0, 5.0) + vec2(uTime * 0.035, -uTime * 0.02));
@@ -1310,6 +1574,7 @@ void main() {
     color = mix(color, vec3(hash(floor(uv * uResolution.xy * 0.08 + uTime * 25.0))), wrongSurge * 0.18);
     color += mix(vec3(0.10, 0.38, 0.42), vec3(1.0, 0.42, 0.08), uTowerAlign) * uSignalReached * (0.24 + 0.12 * sin(uTime * 9.0));
     color += vec3(0.25, 0.95, 1.0) * uFalseStart * (0.55 + 0.25 * sin(uTime * 35.0));
+    color += vec3(1.0, 0.50, 0.14) * atomic * pow(max(0.0, 1.0 - length(center * vec2(1.45, 1.05))), 2.2) * 1.65;
     color = mix(color, vec3(luma(color)) + vec3(0.14, 0.30, 0.28), uSignalReached * 0.22 + uFalseStart * 0.35);
     vec3 bleach = color * color * (3.0 - 2.0 * color);
     color = mix(color, bleach, 0.13 + signalHeat * 0.045);
@@ -1332,6 +1597,7 @@ void main() {
     color = pow(color, vec3(0.88, 0.92, 1.0));
     color *= vec3(0.92, 1.03, 1.12);
     color *= 1.0 - smoothstep(0.55, 0.9, length(center));
+    color = mix(color, vec3(0.0), endFade);
     FragColor = vec4(color, 1.0);
 }
 )GLSL";
@@ -1453,6 +1719,15 @@ static void render() {
     glUniform1f(glGetUniformLocation(g_postProgram, "uWrongWay"), g_wrongWaySignal);
     glUniform1f(glGetUniformLocation(g_postProgram, "uSignalReached"), g_signalReached);
     glUniform1f(glGetUniformLocation(g_postProgram, "uFalseStart"), g_falseStartFlash);
+    float atomicFlash = 0.0f;
+    float atomicBlastTime = g_atomicTime - kAtomicDropSeconds;
+    if (atomicBlastTime >= 0.0f && atomicBlastTime < 18.0f) {
+        atomicFlash = smoothstep(4.8f, 0.0f, atomicBlastTime);
+        atomicFlash += smoothstep(0.0f, 1.2f, atomicBlastTime) * smoothstep(16.0f, 4.0f, atomicBlastTime) * 0.82f;
+        atomicFlash = clampf(atomicFlash * g_atomicYield, 0.0f, 1.0f);
+    }
+    glUniform1f(glGetUniformLocation(g_postProgram, "uAtomicFlash"), atomicFlash);
+    glUniform1f(glGetUniformLocation(g_postProgram, "uAtomicFade"), atomicEndFade());
     glUniform3f(glGetUniformLocation(g_postProgram, "uResolution"), static_cast<float>(g_width), static_cast<float>(g_height), 0.0f);
     glBindVertexArray(g_quadVao);
     glDrawArrays(GL_TRIANGLES, 0, 6);
@@ -1491,6 +1766,11 @@ static bool collidesWithBuilding(Vec3 position) {
 }
 static void update(float dt) {
     updateMouse();
+    pollAtomicTriggers(dt);
+    if (atomicEndFade() >= 0.995f) {
+        g_atomicEnded = true;
+        return;
+    }
     float speed = keyDown(VK_SHIFT) ? 34.0f : 18.0f;
     Vec3 forward{std::sin(g_yaw), 0.0f, std::cos(g_yaw)};
     Vec3 right{std::cos(g_yaw), 0.0f, -std::sin(g_yaw)};
